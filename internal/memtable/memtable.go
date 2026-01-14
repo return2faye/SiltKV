@@ -1,0 +1,3 @@
+package memtable
+
+// Memtable implementation
