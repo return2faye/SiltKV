@@ -10,8 +10,9 @@ import (
 )
 
 var (
-	ErrChecksum = errors.New("wal: invalid checksum")
-	ErrClosed   = errors.New("wal: writer is closed")
+	ErrChecksum    = errors.New("wal: invalid checksum")
+	ErrClosed      = errors.New("wal: writer is closed")
+	ErrInvalidSize = errors.New("wal: invalid key or value size")
 )
 
 const (
@@ -22,6 +23,12 @@ const (
 	headerSize = 12
 	// initialDataBufferSize is the initial capacity for the reusable data buffer in Load
 	initialDataBufferSize = 1024
+	// maxKeySize is the maximum allowed key size (1MB)
+	maxKeySize = 1 << 20
+	// maxValueSize is the maximum allowed value size (10MB)
+	maxValueSize = 10 << 20
+	// maxRecordSize is the maximum allowed total record size (header + key + value)
+	maxRecordSize = headerSize + maxKeySize + maxValueSize
 )
 
 // Write-Ahead Log implementation
@@ -90,17 +97,28 @@ func (w *WalWriter) Sync() error {
 	return w.file.Sync()
 }
 
-func (w *WalWriter) Load(apply func(k, v []byte)) error {
+// LoadResult contains statistics about the Load operation
+type LoadResult struct {
+	Recovered int // number of records successfully recovered
+	Skipped   int // number of corrupted records skipped
+}
+
+// Load restores data from WAL file with fault tolerance
+// It skips corrupted records and continues recovery instead of stopping
+// Returns LoadResult with recovery statistics
+func (w *WalWriter) Load(apply func(k, v []byte)) (*LoadResult, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.file == nil {
-		return ErrClosed
+		return nil, ErrClosed
 	}
 
 	if _, err := w.file.Seek(0, 0); err != nil {
-		return err
+		return nil, err
 	}
+
+	result := &LoadResult{}
 
 	for {
 		// Reuse header buffer (fixed size)
@@ -109,32 +127,54 @@ func (w *WalWriter) Load(apply func(k, v []byte)) error {
 			break
 		}
 		if err != nil {
-			return err
+			// If we can't read header, we've reached end or file is corrupted
+			// Try to continue from next potential record boundary
+			// For now, we'll break and return partial recovery
+			break
 		}
 
 		expectSum := binary.LittleEndian.Uint32(w.headerBuf[0:4])
 		ksiz := binary.LittleEndian.Uint32(w.headerBuf[4:8])
 		vsiz := binary.LittleEndian.Uint32(w.headerBuf[8:12])
 
-		// Reuse data buffer, grow if needed
+		// Security: Validate sizes to prevent memory exhaustion attacks
+		if ksiz > maxKeySize || vsiz > maxValueSize {
+			// Invalid size, skip this record
+			result.Skipped++
+			// Try to find next record by seeking forward
+			// For simplicity, we'll break here (could implement more sophisticated recovery)
+			break
+		}
+
 		neededSize := int(ksiz + vsiz)
+		if neededSize > maxRecordSize-headerSize {
+			result.Skipped++
+			break
+		}
+
+		// Reuse data buffer, grow if needed
 		if cap(w.dataBuf) < neededSize {
 			w.dataBuf = make([]byte, neededSize)
 		}
 		data := w.dataBuf[:neededSize]
 
 		if _, err := io.ReadFull(w.file, data); err != nil {
-			return err
+			// Can't read data, skip this record
+			result.Skipped++
+			break
 		}
 
-		// check sum
+		// Verify checksum
 		actualSum := crc32.ChecksumIEEE(w.headerBuf[4:])
 		actualSum = crc32.Update(actualSum, crc32.IEEETable, data)
 		if expectSum != actualSum {
-			return ErrChecksum
+			// Checksum mismatch, skip this corrupted record
+			result.Skipped++
+			// Continue to next record instead of stopping
+			continue
 		}
 
-		// restore data
+		// Checksum valid, restore data
 		key := data[:ksiz]
 		value := data[ksiz:]
 
@@ -144,9 +184,10 @@ func (w *WalWriter) Load(apply func(k, v []byte)) error {
 		} else {
 			apply(key, value)
 		}
+		result.Recovered++
 	}
 
-	return nil
+	return result, nil
 }
 
 // Close closes the WAL file
