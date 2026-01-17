@@ -14,10 +14,17 @@ var (
 	ErrClosed   = errors.New("wal: writer is closed")
 )
 
+const (
+	// initialBufferSize is the initial capacity for the reusable write buffer
+	// This reduces allocations for small writes
+	initialBufferSize = 512
+)
+
 // Write-Ahead Log implementation
 type WalWriter struct {
 	mu   sync.Mutex
 	file *os.File
+	buf  []byte // reusable buffer for Write operations
 }
 
 func NewWalWriter(path string) (*WalWriter, error) {
@@ -25,7 +32,10 @@ func NewWalWriter(path string) (*WalWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &WalWriter{file: f}, nil
+	return &WalWriter{
+		file: f,
+		buf:  make([]byte, 0, initialBufferSize), // pre-allocate buffer capacity
+	}, nil
 }
 
 func (w *WalWriter) Write(key, value []byte) error {
@@ -39,7 +49,13 @@ func (w *WalWriter) Write(key, value []byte) error {
 	ksiz := len(key)
 	vsiz := len(value)
 	// Header(12) = CheckSum(4) + kSize(4) + VSize(4)
-	buf := make([]byte, 12+ksiz+vsiz)
+	neededSize := 12 + ksiz + vsiz
+
+	// Reuse buffer if capacity is sufficient, otherwise grow it
+	if cap(w.buf) < neededSize {
+		w.buf = make([]byte, neededSize)
+	}
+	buf := w.buf[:neededSize]
 
 	binary.LittleEndian.PutUint32(buf[4:8], uint32(ksiz))
 	binary.LittleEndian.PutUint32(buf[8:12], uint32(vsiz))
