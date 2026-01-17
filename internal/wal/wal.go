@@ -18,13 +18,19 @@ const (
 	// initialBufferSize is the initial capacity for the reusable write buffer
 	// This reduces allocations for small writes
 	initialBufferSize = 512
+	// headerSize is the fixed size of WAL record header
+	headerSize = 12
+	// initialDataBufferSize is the initial capacity for the reusable data buffer in Load
+	initialDataBufferSize = 1024
 )
 
 // Write-Ahead Log implementation
 type WalWriter struct {
-	mu   sync.Mutex
-	file *os.File
-	buf  []byte // reusable buffer for Write operations
+	mu        sync.Mutex
+	file      *os.File
+	buf       []byte // reusable buffer for Write operations
+	headerBuf []byte // reusable buffer for Load header (fixed 12 bytes)
+	dataBuf   []byte // reusable buffer for Load data (grows as needed)
 }
 
 func NewWalWriter(path string) (*WalWriter, error) {
@@ -33,8 +39,10 @@ func NewWalWriter(path string) (*WalWriter, error) {
 		return nil, err
 	}
 	return &WalWriter{
-		file: f,
-		buf:  make([]byte, 0, initialBufferSize), // pre-allocate buffer capacity
+		file:      f,
+		buf:       make([]byte, 0, initialBufferSize),     // pre-allocate write buffer capacity
+		headerBuf: make([]byte, headerSize),               // fixed-size header buffer
+		dataBuf:   make([]byte, 0, initialDataBufferSize), // pre-allocate data buffer capacity
 	}, nil
 }
 
@@ -95,8 +103,8 @@ func (w *WalWriter) Load(apply func(k, v []byte)) error {
 	}
 
 	for {
-		header := make([]byte, 12)
-		_, err := io.ReadFull(w.file, header)
+		// Reuse header buffer (fixed size)
+		_, err := io.ReadFull(w.file, w.headerBuf)
 		if err == io.EOF {
 			break
 		}
@@ -104,17 +112,23 @@ func (w *WalWriter) Load(apply func(k, v []byte)) error {
 			return err
 		}
 
-		expectSum := binary.LittleEndian.Uint32(header[0:4])
-		ksiz := binary.LittleEndian.Uint32(header[4:8])
-		vsiz := binary.LittleEndian.Uint32(header[8:12])
+		expectSum := binary.LittleEndian.Uint32(w.headerBuf[0:4])
+		ksiz := binary.LittleEndian.Uint32(w.headerBuf[4:8])
+		vsiz := binary.LittleEndian.Uint32(w.headerBuf[8:12])
 
-		data := make([]byte, ksiz+vsiz)
+		// Reuse data buffer, grow if needed
+		neededSize := int(ksiz + vsiz)
+		if cap(w.dataBuf) < neededSize {
+			w.dataBuf = make([]byte, neededSize)
+		}
+		data := w.dataBuf[:neededSize]
+
 		if _, err := io.ReadFull(w.file, data); err != nil {
 			return err
 		}
 
 		// check sum
-		actualSum := crc32.ChecksumIEEE(header[4:])
+		actualSum := crc32.ChecksumIEEE(w.headerBuf[4:])
 		actualSum = crc32.Update(actualSum, crc32.IEEETable, data)
 		if expectSum != actualSum {
 			return ErrChecksum
