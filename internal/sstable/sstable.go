@@ -1,3 +1,0 @@
-package sstable
-
-// SSTable implementation
