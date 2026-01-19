@@ -110,10 +110,6 @@ func (sl *SkipList) Get(key []byte) ([]byte, bool) {
 	return nil, false
 }
 
-// Tombstone
-func (sl *SkipList) Delete(key []byte) {
-	sl.Put(key, nil)
-}
 
 // deep copy of bytes slice
 // Depensive Copying: not modify original array
