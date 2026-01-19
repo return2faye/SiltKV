@@ -46,7 +46,7 @@ func (w *Writer) WriteFromIterator(it *memtable.SLIterator) error {
 		key := it.Key()
 		val := it.Value()
 
-		klen := uint32((len(key)))
+		klen := uint32(len(key))
 		vlen := uint32(len(val))
 
 		// write header: Length Prefix
@@ -55,17 +55,17 @@ func (w *Writer) WriteFromIterator(it *memtable.SLIterator) error {
 		binary.LittleEndian.PutUint32(header[4:8], vlen)
 
 		if _, err := w.file.Write(header); err != nil {
-			return nil
+			return err
 		}
 
 		// write key
 		if _, err := w.file.Write(key); err != nil {
-			return nil
+			return err
 		}
 
 		// write value
 		if _, err := w.file.Write(val); err != nil {
-			return nil
+			return err
 		}
 
 		it.Next()
