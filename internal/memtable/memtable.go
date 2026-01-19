@@ -1,7 +1,9 @@
 package memtable
 
 import (
+	"errors"
 	"log"
+	"sync"
 
 	"github.com/macz/SiltKV/internal/wal"
 )
@@ -12,12 +14,16 @@ const (
 	DefaultMaxSize = 4 << 20
 )
 
+var ErrFrozen = errors.New("memtable: frozen")
+
 // Memtable wraps SkipList with WAL support for durability
 type Memtable struct {
 	sl      *SkipList
 	wal     *wal.WalWriter
 	maxSize int // maximum size before flush
 	size    int // current estimated size
+	frozen  bool
+	mu      sync.RWMutex // protects frozen flag and size counter
 }
 
 // NewMemtable creates a new memtable with WAL support
@@ -51,15 +57,22 @@ func NewMemtable(walPath string) (*Memtable, error) {
 // Put inserts or updates a key-value pair
 // Writes to WAL first (for durability), then to SkipList (for fast access)
 func (mt *Memtable) Put(key, value []byte) error {
+	mt.mu.Lock()
+	if mt.frozen {
+		mt.mu.Unlock()
+		return ErrFrozen
+	}
 	// Step 1: Write to WAL first (persistence)
 	// If WAL write fails, we don't write to memory to maintain consistency
 	if err := mt.wal.Write(key, value); err != nil {
+		mt.mu.Unlock()
 		return err
 	}
 
 	// Step 2: Force sync to disk (trade-off: safety vs performance)
 	if err := mt.wal.Sync(); err != nil {
-	    return err
+		mt.mu.Unlock()
+		return err
 	}
 
 	// Step 3: Write to SkipList (memory)
@@ -74,6 +87,7 @@ func (mt *Memtable) Put(key, value []byte) error {
 		mt.size -= len(key) + len(oldValue)
 	}
 	mt.size += len(key) + len(value)
+	mt.mu.Unlock()
 
 	return nil
 }
@@ -94,13 +108,37 @@ func (mt *Memtable) Delete(key []byte) error {
 
 // Size returns the estimated current size of memtable
 func (mt *Memtable) Size() int {
+	mt.mu.RLock()
+	defer mt.mu.RUnlock()
 	return mt.size
 }
 
 // IsFull checks if memtable has reached maximum size
 // When full, memtable should be flushed to SSTable
 func (mt *Memtable) IsFull() bool {
+	mt.mu.RLock()
+	defer mt.mu.RUnlock()
 	return mt.size >= mt.maxSize
+}
+
+// Freeze marks memtable as immutable. Subsequent Put/Delete will fail with ErrFrozen.
+// Reads are still allowed. This should be called before flushing to SSTable.
+func (mt *Memtable) Freeze() error {
+	mt.mu.Lock()
+	defer mt.mu.Unlock()
+	if mt.frozen {
+		return nil
+	}
+	mt.frozen = true
+	// Ensure WAL is synced before flush starts
+	return mt.wal.Sync()
+}
+
+// IsFrozen indicates whether the memtable has been frozen (immutable).
+func (mt *Memtable) IsFrozen() bool {
+	mt.mu.RLock()
+	defer mt.mu.RUnlock()
+	return mt.frozen
 }
 
 // recoverFromWAL restores memtable from WAL file
@@ -113,9 +151,13 @@ func (mt *Memtable) recoverFromWAL() error {
 		// Update size estimate
 		if v == nil {
 			// Tombstone (delete), only count key
+			mt.mu.Lock()
 			mt.size += len(k)
+			mt.mu.Unlock()
 		} else {
+			mt.mu.Lock()
 			mt.size += len(k) + len(v)
+			mt.mu.Unlock()
 		}
 	})
 
@@ -125,7 +167,7 @@ func (mt *Memtable) recoverFromWAL() error {
 
 	// Log recovery statistics
 	log.Printf("Memtable recovery: %d records recovered, %d skipped",
-	    result.Recovered, result.Skipped)
+		result.Recovered, result.Skipped)
 	_ = result // Recovery statistics available for logging if needed
 
 	return nil
