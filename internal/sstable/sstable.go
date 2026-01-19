@@ -1,15 +1,17 @@
 package sstable
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"os"
 
 	"github.com/macz/SiltKV/internal/memtable"
+	"github.com/macz/SiltKV/internal/utils"
 )
 
 const (
-	maxSStableKeySize = 1 << 20 // 1MB
+	maxSSTableKeySize   = 1 << 20  // 1MB
 	maxSSTableValueSize = 10 << 20 // 10MB
 )
 
@@ -83,7 +85,7 @@ func (w *Writer) WriteFromIterator(it *memtable.SLIterator) error {
 
 // Read from SSTable files
 type Reader struct {
-	file *os.File
+	file     *os.File
 	fileSize int64
 }
 
@@ -100,7 +102,7 @@ func NewReader(path string) (*Reader, error) {
 	}
 
 	return &Reader{
-		file: f,
+		file:     f,
 		fileSize: stat.Size(),
 	}, nil
 }
@@ -114,8 +116,40 @@ func (r *Reader) Close() error {
 	return err
 }
 
+func (r *Reader) Get(key []byte) ([]byte, bool, error) {
+	if r == nil || r.file == nil {
+		return nil, false, os.ErrInvalid
+	}
+
+	it := r.NewIterator()
+
+	// move it to first data
+	if err := it.Next(); err != nil {
+		return nil, false, err
+	}
+
+	// v1: linear Scan
+	for it.Valid() {
+		cmp := bytes.Compare(it.Key(), key)
+		if cmp == 0 {
+			val := utils.CopyBytes(it.Value())
+			return val, true, nil
+		}
+		// exceed target key, terminate
+		if cmp > 0 {
+			return nil, false, nil
+		}
+
+		if err := it.Next(); err != nil {
+			return nil, false, err
+		}
+	}
+
+	return nil, false, nil
+}
+
 type Iterator struct {
-	r *Reader
+	r   *Reader
 	pos int64 // offset in file
 	key []byte
 	val []byte
@@ -124,7 +158,7 @@ type Iterator struct {
 
 func (r *Reader) NewIterator() *Iterator {
 	return &Iterator{
-		r: r,
+		r:   r,
 		pos: 0,
 	}
 }
@@ -149,7 +183,7 @@ func (it *Iterator) Next() error {
 		return os.ErrInvalid
 	}
 
-	if it.pos + 8 > it.r.fileSize {
+	if it.pos+8 > it.r.fileSize {
 		it.eof = true
 		it.key, it.val = nil, nil
 		return nil
@@ -182,7 +216,7 @@ func (it *Iterator) Next() error {
 	vlen := binary.LittleEndian.Uint32(header[4:8])
 
 	// security check
-	if klen > maxSStableKeySize {
+	if klen > maxSSTableKeySize {
 		return io.ErrUnexpectedEOF
 	}
 
@@ -201,11 +235,11 @@ func (it *Iterator) Next() error {
 	}
 
 	buf := make([]byte, totalLen)
-	n, err = it.r.file.ReadAt(buf, it.pos + 8)
+	n, err = it.r.file.ReadAt(buf, it.pos+8)
 	if err != nil && err != io.EOF {
 		return err
 	}
-	
+
 	if int64(n) < totalLen {
 		return io.ErrUnexpectedEOF
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"math/rand"
 	"sync"
+	"github.com/macz/SiltKV/internal/utils"
 )
 
 // implementation of skiplist
@@ -62,7 +63,7 @@ func (sl *SkipList) Put(key, val []byte) {
 	// if already exist, update
 	curr = curr.next[0]
 	if curr != nil && bytes.Equal(curr.key, key) {
-		curr.value = copyBytes(val)
+		curr.value = utils.CopyBytes(val)
 		return
 	}
 
@@ -76,8 +77,8 @@ func (sl *SkipList) Put(key, val []byte) {
 	}
 
 	newNode := &Node{
-		key:   copyBytes(key),
-		value: copyBytes(val),
+		key:   utils.CopyBytes(key),
+		value: utils.CopyBytes(val),
 		next:  make([]*Node, lvl),
 	}
 
@@ -111,13 +112,6 @@ func (sl *SkipList) Get(key []byte) ([]byte, bool) {
 }
 
 
-// deep copy of bytes slice
-// Depensive Copying: not modify original array
-func copyBytes(b []byte) []byte {
-	cp := make([]byte, len(b))
-	copy(cp, b)
-	return cp
-}
 
 /*
 Iterator
