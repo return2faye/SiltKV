@@ -8,6 +8,11 @@ import (
 	"github.com/macz/SiltKV/internal/memtable"
 )
 
+const (
+	maxSStableKeySize = 1 << 20 // 1MB
+	maxSSTableValueSize = 10 << 20 // 10MB
+)
+
 // abstraction of SSTable
 // read single .sst file
 type Table struct {
@@ -79,6 +84,7 @@ func (w *Writer) WriteFromIterator(it *memtable.SLIterator) error {
 // Read from SSTable files
 type Reader struct {
 	file *os.File
+	fileSize int64
 }
 
 func NewReader(path string) (*Reader, error) {
@@ -87,7 +93,16 @@ func NewReader(path string) (*Reader, error) {
 		return nil, err
 	}
 
-	return &Reader{file: f}, nil
+	stat, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+
+	return &Reader{
+		file: f,
+		fileSize: stat.Size(),
+	}, nil
 }
 
 func (r *Reader) Close() error {
@@ -134,6 +149,12 @@ func (it *Iterator) Next() error {
 		return os.ErrInvalid
 	}
 
+	if it.pos + 8 > it.r.fileSize {
+		it.eof = true
+		it.key, it.val = nil, nil
+		return nil
+	}
+
 	// read header
 	header := make([]byte, 8)
 
@@ -144,25 +165,49 @@ func (it *Iterator) Next() error {
 		it.key, it.val = nil, nil
 		return nil
 	}
-	// TODO: handle 
 
 	// other problems
 	if err != nil && err != io.EOF {
 		return err
 	}
 
+	// header incomplete
+	if n < 8 {
+		it.eof = true
+		it.key, it.val = nil, nil
+		return nil
+	}
+
 	klen := binary.LittleEndian.Uint32(header[0:4])
 	vlen := binary.LittleEndian.Uint32(header[4:8])
 
-	// scurity check
+	// security check
+	if klen > maxSStableKeySize {
+		return io.ErrUnexpectedEOF
+	}
+
+	if vlen > maxSSTableValueSize {
+		return io.ErrUnexpectedEOF
+	}
+
 	totalLen := int64(klen) + int64(vlen)
 	if totalLen < 0 {
 		return io.ErrUnexpectedEOF
 	}
 
+	expectedEnd := it.pos + 8 + totalLen
+	if expectedEnd > it.r.fileSize {
+		return io.ErrUnexpectedEOF
+	}
+
 	buf := make([]byte, totalLen)
-	if _, err := it.r.file.ReadAt(buf, it.pos+8); err != nil {
-		return nil
+	n, err = it.r.file.ReadAt(buf, it.pos + 8)
+	if err != nil && err != io.EOF {
+		return err
+	}
+	
+	if int64(n) < totalLen {
+		return io.ErrUnexpectedEOF
 	}
 
 	it.key = buf[:klen]
