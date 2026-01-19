@@ -2,6 +2,7 @@ package sstable
 
 import (
 	"encoding/binary"
+	"io"
 	"os"
 
 	"github.com/macz/SiltKV/internal/memtable"
@@ -37,6 +38,7 @@ func (w *Writer) Close() error {
 	return err
 }
 
+// format: [klen(4)][vlen(4)][key][value]
 func (w *Writer) WriteFromIterator(it *memtable.SLIterator) error {
 	if w.file == nil {
 		return os.ErrInvalid
@@ -125,5 +127,49 @@ func (it *Iterator) Value() []byte {
 }
 
 func (it *Iterator) Next() error {
+	if it.eof {
+		return nil
+	}
+	if it.r == nil || it.r.file == nil {
+		return os.ErrInvalid
+	}
+
+	// read header
+	header := make([]byte, 8)
+
+	// no header corruption
+	n, err := it.r.file.ReadAt(header, it.pos)
+	if err == io.EOF && n == 0 {
+		it.eof = true
+		it.key, it.val = nil, nil
+		return nil
+	}
+	// TODO: handle 
+
+	// other problems
+	if err != nil && err != io.EOF {
+		return err
+	}
+
+	klen := binary.LittleEndian.Uint32(header[0:4])
+	vlen := binary.LittleEndian.Uint32(header[4:8])
+
+	// scurity check
+	totalLen := int64(klen) + int64(vlen)
+	if totalLen < 0 {
+		return io.ErrUnexpectedEOF
+	}
+
+	buf := make([]byte, totalLen)
+	if _, err := it.r.file.ReadAt(buf, it.pos+8); err != nil {
+		return nil
+	}
+
+	it.key = buf[:klen]
+	it.val = buf[klen:]
+
+	// update position
+	it.pos += 8 + totalLen
+
 	return nil
 }
