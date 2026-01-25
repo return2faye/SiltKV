@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/macz/SiltKV/internal/lsm"
+	"github.com/return2faye/SiltKV/internal/lsm"
 )
 
 func main() {

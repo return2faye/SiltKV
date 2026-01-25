@@ -1,3 +1,3 @@
-module github.com/macz/SiltKV
+module github.com/return2faye/SiltKV
 
 go 1.25.5

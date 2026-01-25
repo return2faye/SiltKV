@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/macz/SiltKV/internal/memtable"
+	"github.com/return2faye/SiltKV/internal/memtable"
 )
 
 func TestFlushAndGet(t *testing.T) {

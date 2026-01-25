@@ -6,8 +6,8 @@ import (
 	"io"
 	"os"
 
-	"github.com/macz/SiltKV/internal/memtable"
-	"github.com/macz/SiltKV/internal/utils"
+	"github.com/return2faye/SiltKV/internal/memtable"
+	"github.com/return2faye/SiltKV/internal/utils"
 )
 
 const (

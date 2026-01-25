@@ -5,7 +5,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/macz/SiltKV/internal/wal"
+	"github.com/return2faye/SiltKV/internal/wal"
 )
 
 const (

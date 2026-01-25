@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/macz/SiltKV/internal/lsm"
-	"github.com/macz/SiltKV/internal/sstable"
+	"github.com/return2faye/SiltKV/internal/lsm"
+	"github.com/return2faye/SiltKV/internal/sstable"
 )
 
 func main() {

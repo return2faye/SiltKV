@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/macz/SiltKV/internal/memtable"
-	"github.com/macz/SiltKV/internal/sstable"
-	"github.com/macz/SiltKV/internal/utils"
+	"github.com/return2faye/SiltKV/internal/memtable"
+	"github.com/return2faye/SiltKV/internal/sstable"
+	"github.com/return2faye/SiltKV/internal/utils"
 )
 
 var ErrClosed = errors.New("lsm: db is closed")
