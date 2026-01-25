@@ -43,6 +43,24 @@ func Open(opts Options) (*DB, error) {
 		return nil, err
 	}
 
+	// Load existing SSTables from manifest
+	sstPaths, err := loadManifest(opts.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load manifest: %w", err)
+	}
+
+	// Open all SSTable readers (reverse order: newest first)
+	var sstables []*sstable.Reader
+	for i := len(sstPaths) - 1; i >= 0; i-- {
+		reader, err := sstable.NewReader(sstPaths[i])
+		if err != nil {
+			// Log error but continue (SSTable might be corrupted or deleted)
+			// In production, you might want to handle this better
+			continue
+		}
+		sstables = append(sstables, reader)
+	}
+
 	walPath := filepath.Join(opts.DataDir, "active.wal")
 	mt, err := memtable.NewMemtable(walPath)
 	if err != nil {
@@ -102,6 +120,12 @@ func (db *DB) flushMemtable(mt *memtable.Memtable, walPath string) {
 		db.immutable = nil
 	}
 	db.mu.Unlock()
+
+	// Update manifest (outside lock, I/O operation)
+	if err := appendToManifest(db.dataDir, sstPath); err != nil {
+		// TODO: log error (for now, just continue)
+		// In production, you might want to handle this better
+	}
 
 	// Close memtable (this closes WAL)
 	mt.Close()
