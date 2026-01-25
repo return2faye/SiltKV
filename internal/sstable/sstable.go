@@ -12,8 +12,14 @@ import (
 
 const (
 	maxSSTableKeySize   = 1 << 20  // 1MB
-	maxSSTableValueSize = 10 << 20 // 10MB
+	maxSSTableValueSize = 4 << 20  // 4MB
+	maxSSTableFileSize  = 64 << 20 // 64MB - maximum size for a single SSTable file
 )
+
+// MaxSSTableFileSize returns the maximum size for a single SSTable file.
+func MaxSSTableFileSize() int64 {
+	return maxSSTableFileSize
+}
 
 // abstraction of SSTable
 // read single .sst file
@@ -24,7 +30,8 @@ type Table struct {
 
 // flush memtable into SSTable file
 type Writer struct {
-	file *os.File
+	file     *os.File
+	fileSize int64 // track current file size
 }
 
 func NewWriter(path string) (*Writer, error) {
@@ -33,7 +40,7 @@ func NewWriter(path string) (*Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Writer{file: f}, nil
+	return &Writer{file: f, fileSize: 0}, nil
 }
 
 func (w *Writer) Close() error {
@@ -77,16 +84,55 @@ func (w *Writer) WriteFromIterator(it *memtable.SLIterator) error {
 			return err
 		}
 
+		// Update file size
+		w.fileSize += int64(8 + len(key) + len(val))
+
 		it.Next()
 	}
 
 	return nil
 }
 
+// Write writes a single key-value pair to the SSTable.
+// Returns the current file size after write.
+func (w *Writer) Write(key, value []byte) (int64, error) {
+	if w.file == nil {
+		return 0, os.ErrInvalid
+	}
+
+	klen := uint32(len(key))
+	vlen := uint32(len(value))
+
+	header := make([]byte, 8)
+	binary.LittleEndian.PutUint32(header[0:4], klen)
+	binary.LittleEndian.PutUint32(header[4:8], vlen)
+
+	recordSize := int64(8 + len(key) + len(value))
+
+	if _, err := w.file.Write(header); err != nil {
+		return 0, err
+	}
+	if _, err := w.file.Write(key); err != nil {
+		return 0, err
+	}
+	if _, err := w.file.Write(value); err != nil {
+		return 0, err
+	}
+
+	w.fileSize += recordSize
+	return w.fileSize, nil
+}
+
+// Size returns the current file size.
+func (w *Writer) Size() int64 {
+	return w.fileSize
+}
+
 // Read from SSTable files
 type Reader struct {
 	file     *os.File
 	fileSize int64
+	path     string
 }
 
 func NewReader(path string) (*Reader, error) {
@@ -104,7 +150,13 @@ func NewReader(path string) (*Reader, error) {
 	return &Reader{
 		file:     f,
 		fileSize: stat.Size(),
+		path:     path,
 	}, nil
+}
+
+// Path returns the file path of this SSTable.
+func (r *Reader) Path() string {
+	return r.path
 }
 
 func (r *Reader) Close() error {

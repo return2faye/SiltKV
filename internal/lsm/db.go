@@ -28,6 +28,10 @@ type DB struct {
 
 	// flush coordination
 	flushWg sync.WaitGroup // wait for flush goroutines to finish
+
+	// compaction coordination
+	compactWg      sync.WaitGroup
+	compactTrigger int // number of SSTables before triggering compaction
 }
 
 type Options struct {
@@ -68,10 +72,10 @@ func Open(opts Options) (*DB, error) {
 	}
 
 	db := &DB{
-		dataDir: opts.DataDir,
-		active:  mt,
-		// immutable: nil,
-		// sstables: nil,
+		dataDir:        opts.DataDir,
+		active:         mt,
+		sstables:       sstables,
+		compactTrigger: 4,
 	}
 
 	return db, nil
@@ -119,6 +123,9 @@ func (db *DB) flushMemtable(mt *memtable.Memtable, walPath string) {
 	if db.immutable == mt {
 		db.immutable = nil
 	}
+
+	// Check if compaction is needed after adding new SSTable
+	shouldCompact := len(db.sstables) >= db.compactTrigger
 	db.mu.Unlock()
 
 	// Update manifest (outside lock, I/O operation)
@@ -130,8 +137,259 @@ func (db *DB) flushMemtable(mt *memtable.Memtable, walPath string) {
 	// Close memtable (this closes WAL)
 	mt.Close()
 
+	// Trigger compaction if needed (outside lock to avoid deadlock)
+	if shouldCompact {
+		db.compactWg.Add(1)
+		go db.compactSSTables()
+	}
+
 	// TODO: Optionally remove old WAL file (os.Remove(walPath))
 	// For now, we'll leave it for debugging
+}
+
+// compactSSTables merges multiple SSTables into one.
+// It's called when the number of SSTables exceeds the threshold.
+// Only the oldest N SSTables are compacted (newest SSTables are preserved).
+func (db *DB) compactSSTables() {
+	defer db.compactWg.Done()
+
+	// Get SSTables to compact (hold lock briefly)
+	db.mu.Lock()
+	if len(db.sstables) < db.compactTrigger {
+		db.mu.Unlock()
+		return
+	}
+
+	// Select only the oldest N SSTables to compact (from the end of the list)
+	// Newest SSTables are preserved to avoid merging them immediately
+	compactCount := db.compactTrigger
+	if len(db.sstables) < compactCount {
+		compactCount = len(db.sstables)
+	}
+
+	// Get the oldest N SSTables (from the end, since list is newest-first)
+	startIdx := len(db.sstables) - compactCount
+	readersToCompact := make([]*sstable.Reader, compactCount)
+	copy(readersToCompact, db.sstables[startIdx:])
+
+	// Track old paths for cleanup
+	oldPaths := make([]string, len(readersToCompact))
+	for i, r := range readersToCompact {
+		oldPaths[i] = r.Path()
+	}
+
+	db.mu.Unlock()
+
+	if len(readersToCompact) == 0 {
+		return
+	}
+
+	// Create merge iterator
+	mergeIt, err := sstable.NewMergeIterator(readersToCompact)
+	if err != nil {
+		// TODO: log error
+		return
+	}
+
+	// Write merged data, splitting into multiple SSTables if needed
+	var newReaders []*sstable.Reader
+	var outputPaths []string
+	fileCounter := 0
+	baseTimestamp := time.Now().UnixNano()
+
+	// Create first writer
+	outputPath := filepath.Join(db.dataDir, fmt.Sprintf("compact-%d-%d.sst", baseTimestamp, fileCounter))
+	writer, err := sstable.NewWriter(outputPath)
+	if err != nil {
+		// TODO: log error
+		return
+	}
+	outputPaths = append(outputPaths, outputPath)
+
+	// Write merged data (keep tombstones for now)
+	written := 0
+	for mergeIt.Valid() {
+		key := mergeIt.Key()
+		value := mergeIt.Value()
+
+		// Check if current file would exceed size limit
+		recordSize := int64(8 + len(key) + len(value))
+		if writer.Size()+recordSize > sstable.MaxSSTableFileSize() && writer.Size() > 0 {
+			// Close current writer and create new one
+			if err := writer.Close(); err != nil {
+				// Cleanup on error
+				for _, p := range outputPaths {
+					os.Remove(p)
+				}
+				// TODO: log error
+				return
+			}
+
+			// Open reader for completed file
+			reader, err := sstable.NewReader(outputPath)
+			if err != nil {
+				// Cleanup on error
+				for _, p := range outputPaths {
+					os.Remove(p)
+				}
+				// TODO: log error
+				return
+			}
+			newReaders = append(newReaders, reader)
+
+			// Create new writer
+			fileCounter++
+			outputPath = filepath.Join(db.dataDir, fmt.Sprintf("compact-%d-%d.sst", baseTimestamp, fileCounter))
+			writer, err = sstable.NewWriter(outputPath)
+			if err != nil {
+				// Cleanup on error
+				for _, r := range newReaders {
+					r.Close()
+				}
+				for _, p := range outputPaths {
+					os.Remove(p)
+				}
+				// TODO: log error
+				return
+			}
+			outputPaths = append(outputPaths, outputPath)
+		}
+
+		// Write key-value pair (including tombstones)
+		// Tombstones (nil values) are kept to mark deletions
+		_, err := writer.Write(key, value)
+		if err != nil {
+			writer.Close()
+			for _, r := range newReaders {
+				r.Close()
+			}
+			for _, p := range outputPaths {
+				os.Remove(p)
+			}
+			// TODO: log error
+			return
+		}
+		written++
+
+		if err := mergeIt.Next(); err != nil {
+			break
+		}
+	}
+
+	// Close last writer
+	if err := writer.Close(); err != nil {
+		for _, r := range newReaders {
+			r.Close()
+		}
+		for _, p := range outputPaths {
+			os.Remove(p)
+		}
+		// TODO: log error
+		return
+	}
+
+	// Open reader for last file
+	lastReader, err := sstable.NewReader(outputPath)
+	if err != nil {
+		for _, r := range newReaders {
+			r.Close()
+		}
+		for _, p := range outputPaths {
+			os.Remove(p)
+		}
+		// TODO: log error
+		return
+	}
+	newReaders = append(newReaders, lastReader)
+
+	// Replace old SSTables with new one
+	db.mu.Lock()
+	// Check if sstables list has changed significantly (another compaction might have happened)
+	// We check if the old SSTables we're trying to replace still exist at the end
+	if len(db.sstables) < len(readersToCompact) {
+		// SSTables were removed by another compaction, abort
+		for _, r := range newReaders {
+			r.Close()
+		}
+		for _, r := range readersToCompact {
+			r.Close()
+		}
+		db.mu.Unlock()
+		for _, p := range outputPaths {
+			os.Remove(p)
+		}
+		return
+	}
+
+	// Verify the SSTables we're replacing are still at the end
+	// (they should be the oldest ones)
+	// Recalculate startIdx in case sstables list changed
+	currentStartIdx := len(db.sstables) - len(readersToCompact)
+	stillMatch := true
+	for i, r := range readersToCompact {
+		if currentStartIdx+i >= len(db.sstables) || db.sstables[currentStartIdx+i] != r {
+			stillMatch = false
+			break
+		}
+	}
+
+	if !stillMatch {
+		// SSTables were changed, abort
+		for _, r := range newReaders {
+			r.Close()
+		}
+		for _, r := range readersToCompact {
+			r.Close()
+		}
+		db.mu.Unlock()
+		for _, p := range outputPaths {
+			os.Remove(p)
+		}
+		return
+	}
+
+	// Close old readers
+	for _, r := range readersToCompact {
+		r.Close()
+	}
+
+	// Replace only the compacted SSTables with new ones
+	// Merged SSTables should be placed at the position of the old SSTables they replaced
+	// (not at the front, because they contain old data, not new data)
+	db.sstables = append(
+		db.sstables[:currentStartIdx], // Keep newer SSTables at the front
+		newReaders...,                 // Place merged SSTables where old ones were
+	)
+
+	// Get all current SSTable paths for manifest rewrite
+	currentPaths := make([]string, len(db.sstables))
+	for i, r := range db.sstables {
+		currentPaths[i] = r.Path()
+	}
+
+	// Check if we need to trigger another compaction
+	shouldCompactAgain := len(db.sstables) >= db.compactTrigger
+	db.mu.Unlock()
+
+	// Delete old SSTable files (outside lock)
+	for _, path := range oldPaths {
+		if err := os.Remove(path); err != nil {
+			// TODO: log error (file might already be deleted)
+		}
+	}
+
+	// Rewrite manifest with current SSTable list
+	if err := rewriteManifest(db.dataDir, currentPaths); err != nil {
+		// TODO: log error
+		// Manifest update failed, but compaction succeeded
+		// Next Open will rebuild manifest from disk
+	}
+
+	// Trigger another compaction if needed (outside lock to avoid deadlock)
+	if shouldCompactAgain {
+		db.compactWg.Add(1)
+		go db.compactSSTables()
+	}
 }
 
 func (db *DB) Close() error {
