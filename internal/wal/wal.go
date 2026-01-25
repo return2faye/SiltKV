@@ -29,6 +29,8 @@ const (
 	maxValueSize = 10 << 20
 	// maxRecordSize is the maximum allowed total record size (header + key + value)
 	maxRecordSize = headerSize + maxKeySize + maxValueSize
+	// maxWriteBufSize is the maximum buffer size before forcing a flush (64KB)
+	maxWriteBufSize = 64 << 10
 )
 
 // Write-Ahead Log implementation
@@ -38,6 +40,11 @@ type WalWriter struct {
 	buf       []byte // reusable buffer for Write operations
 	headerBuf []byte // reusable buffer for Load header (fixed 12 bytes)
 	dataBuf   []byte // reusable buffer for Load data (grows as needed)
+	
+	// Buffered writes for better concurrency
+	writeBuf  []byte // buffer for batched writes
+	bufSize   int // current buffer size
+	maxBufSize int // maximum buffer size before flush
 }
 
 func NewWalWriter(path string) (*WalWriter, error) {
@@ -46,31 +53,29 @@ func NewWalWriter(path string) (*WalWriter, error) {
 		return nil, err
 	}
 	return &WalWriter{
-		file:      f,
-		buf:       make([]byte, 0, initialBufferSize),     // pre-allocate write buffer capacity
-		headerBuf: make([]byte, headerSize),               // fixed-size header buffer
-		dataBuf:   make([]byte, 0, initialDataBufferSize), // pre-allocate data buffer capacity
+		file:       f,
+		buf:        make([]byte, 0, initialBufferSize),     // pre-allocate write buffer capacity
+		headerBuf:  make([]byte, headerSize),               // fixed-size header buffer
+		dataBuf:    make([]byte, 0, initialDataBufferSize), // pre-allocate data buffer capacity
+		writeBuf:   make([]byte, 0, maxWriteBufSize),      // pre-allocate write buffer
+		maxBufSize: maxWriteBufSize,
 	}, nil
 }
 
 func (w *WalWriter) Write(key, value []byte) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.file == nil {
-		return ErrClosed
-	}
-
 	ksiz := len(key)
 	vsiz := len(value)
 	// Header(12) = CheckSum(4) + kSize(4) + VSize(4)
 	neededSize := 12 + ksiz + vsiz
 
-	// Reuse buffer if capacity is sufficient, otherwise grow it
+	// Prepare the record in a local buffer first (no lock)
+	// This reduces lock holding time
+	var buf []byte
 	if cap(w.buf) < neededSize {
-		w.buf = make([]byte, neededSize)
+		buf = make([]byte, neededSize)
+	} else {
+		buf = w.buf[:neededSize]
 	}
-	buf := w.buf[:neededSize]
 
 	binary.LittleEndian.PutUint32(buf[4:8], uint32(ksiz))
 	binary.LittleEndian.PutUint32(buf[8:12], uint32(vsiz))
@@ -81,8 +86,44 @@ func (w *WalWriter) Write(key, value []byte) error {
 	sum := crc32.ChecksumIEEE(buf[4:])
 	binary.LittleEndian.PutUint32(buf[0:4], sum)
 
-	_, err := w.file.Write(buf)
-	return err
+	// Now append to write buffer and potentially flush (with lock)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.file == nil {
+		return ErrClosed
+	}
+
+	// Append to buffer
+	w.writeBuf = append(w.writeBuf, buf...)
+	w.bufSize += neededSize
+
+	// Flush if buffer is large enough
+	if w.bufSize >= w.maxBufSize {
+		if err := w.flushBufferLocked(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// flushBufferLocked flushes the write buffer to disk
+// Must be called with mu locked
+func (w *WalWriter) flushBufferLocked() error {
+	if len(w.writeBuf) == 0 {
+		return nil
+	}
+	
+	_, err := w.file.Write(w.writeBuf)
+	if err != nil {
+		return err
+	}
+	
+	// Reset buffer
+	w.writeBuf = w.writeBuf[:0]
+	w.bufSize = 0
+	return nil
 }
 
 // file.Write only writes to Page Cache in Kernel
@@ -94,6 +135,12 @@ func (w *WalWriter) Sync() error {
 	if w.file == nil {
 		return ErrClosed
 	}
+
+	// Flush any pending buffered writes first
+	if err := w.flushBufferLocked(); err != nil {
+		return err
+	}
+
 	return w.file.Sync()
 }
 
@@ -199,6 +246,9 @@ func (w *WalWriter) Close() error {
 	if w.file == nil {
 		return nil // already closed
 	}
+
+	// Flush any pending buffered writes first
+	w.flushBufferLocked()
 
 	err := w.file.Close()
 	w.file = nil // mark as closed

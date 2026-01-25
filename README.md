@@ -167,15 +167,22 @@ go run cmd/demo/recovery_demo.go
   - Writes go to memtable first (in-memory)
   - Background flush to SSTable doesn't block writes
   - No per-operation disk sync (sync happens on memtable freeze)
+  - **~493ns per write operation** (single-threaded)
+  - **~671ns per write operation** (concurrent, 14 goroutines)
+  - Fine-grained locking for excellent concurrency
 
 - **Read Performance**: 
-  - Fast reads from memtable (SkipList)
+  - Fast reads from memtable (SkipList): **~105ns**
+  - SSTable reads: **~134ns** with sparse index
+  - Concurrent reads: **~168ns** per operation
   - Sparse index enables direct block access
   - Bloom filter reduces unnecessary disk reads
 
 - **Space Efficiency**:
   - Automatic compaction reduces space amplification
   - Tombstones mark deleted keys (cleaned during compaction)
+
+See [benchmark/README.md](./benchmark/README.md) for detailed performance metrics.
 
 ## Configuration
 
