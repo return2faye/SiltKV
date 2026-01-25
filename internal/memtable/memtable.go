@@ -64,18 +64,13 @@ func (mt *Memtable) Put(key, value []byte) error {
 	}
 	// Step 1: Write to WAL first (persistence)
 	// If WAL write fails, we don't write to memory to maintain consistency
+	// Note: We don't Sync() here for performance. Sync happens when memtable is frozen (before flush).
 	if err := mt.wal.Write(key, value); err != nil {
 		mt.mu.Unlock()
 		return err
 	}
 
-	// Step 2: Force sync to disk (trade-off: safety vs performance)
-	if err := mt.wal.Sync(); err != nil {
-		mt.mu.Unlock()
-		return err
-	}
-
-	// Step 3: Write to SkipList (memory)
+	// Step 2: Write to SkipList (memory)
 	// Get old size before update to calculate size change
 	oldValue, existed := mt.sl.Get(key)
 
