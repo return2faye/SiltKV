@@ -21,9 +21,9 @@ var ErrFrozen = errors.New("memtable: frozen")
 type Memtable struct {
 	sl      *SkipList
 	wal     *wal.WalWriter
-	maxSize int // maximum size before flush
-	size    int64 // current estimated size (atomic)
-	frozen  int32 // atomic flag: 0 = not frozen, 1 = frozen
+	maxSize int          // maximum size before flush
+	size    int64        // current estimated size (atomic)
+	frozen  int32        // atomic flag: 0 = not frozen, 1 = frozen
 	mu      sync.RWMutex // protects WAL writes (must be sequential)
 }
 
