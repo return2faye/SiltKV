@@ -51,17 +51,17 @@ Current benchmark results (Apple M4 Pro, Go 1.x):
 
 | Benchmark | Performance | Memory | Allocations |
 |-----------|-------------|--------|-------------|
-| **BenchmarkPut** | 493.0 ns/op | 138 B/op | 4 allocs/op |
-| **BenchmarkGet** | 104.7 ns/op | 38 B/op | 3 allocs/op |
-| **BenchmarkGetFromSSTable** | 134.3 ns/op | 240 B/op | 3 allocs/op |
-| **BenchmarkPutGet** | ~600 ns/op | ~186 B/op | ~7 allocs/op |
-| **BenchmarkSequentialWrite** | 579.3 ns/op | 197 B/op | 8 allocs/op |
-| **BenchmarkRandomRead** | 224.5 ns/op | 48 B/op | 3 allocs/op |
-| **BenchmarkDelete** | 776.9 ns/op | 128 B/op | 3 allocs/op |
-| **BenchmarkWriteLargeValues** (10KB) | 10,591 ns/op | 25,061 B/op | 17 allocs/op |
-| **BenchmarkWriteSmallValues** | 680.7 ns/op | 170 B/op | 8 allocs/op |
-| **BenchmarkConcurrentWrites** | 671.3 ns/op | 71 B/op | 5 allocs/op |
-| **BenchmarkConcurrentReads** | 168.2 ns/op | 51 B/op | 4 allocs/op |
+| **BenchmarkPut** | 364.5 ns/op | 136 B/op | 4 allocs/op |
+| **BenchmarkGet** | 109.7 ns/op | 38 B/op | 3 allocs/op |
+| **BenchmarkGetFromSSTable** | 145.3 ns/op | 240 B/op | 3 allocs/op |
+| **BenchmarkPutGet** | 471.6 ns/op | 233 B/op | 7 allocs/op |
+| **BenchmarkSequentialWrite** | 535.9 ns/op | 200 B/op | 8 allocs/op |
+| **BenchmarkRandomRead** | 208.6 ns/op | 48 B/op | 3 allocs/op |
+| **BenchmarkDelete** | 582.6 ns/op | 123 B/op | 3 allocs/op |
+| **BenchmarkWriteLargeValues** (10KB) | 20,623 ns/op | 28,242 B/op | 22 allocs/op |
+| **BenchmarkWriteSmallValues** | 397.7 ns/op | 167 B/op | 8 allocs/op |
+| **BenchmarkConcurrentWrites** | 586.5 ns/op | 76 B/op | 5 allocs/op |
+| **BenchmarkConcurrentReads** | 310.0 ns/op | 51 B/op | 4 allocs/op |
 
 ### Performance Highlights
 

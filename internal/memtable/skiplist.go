@@ -25,6 +25,8 @@ type SkipList struct {
 	level int
 	size  int
 	mu    sync.RWMutex
+	// reuse update array for inserts to avoid per-Put allocations
+	update [MaxLevel]*Node
 }
 
 func NewSkipList() *SkipList {
@@ -49,7 +51,8 @@ func (sl *SkipList) Put(key, val []byte) {
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
 
-	update := make([]*Node, MaxLevel)
+	// reuse pre-allocated update array to reduce allocations
+	update := sl.update[:]
 	curr := sl.head
 
 	for i := sl.level - 1; i >= 0; i-- {
@@ -63,6 +66,11 @@ func (sl *SkipList) Put(key, val []byte) {
 	// if already exist, update
 	curr = curr.next[0]
 	if curr != nil && bytes.Equal(curr.key, key) {
+		if curr.value != nil && val == nil {
+			sl.size--
+		} else if curr.value == nil && val != nil {
+			sl.size++
+		}
 		curr.value = utils.CopyBytes(val)
 		return
 	}
