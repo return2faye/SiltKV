@@ -21,10 +21,11 @@ var ErrFrozen = errors.New("memtable: frozen")
 type Memtable struct {
 	sl      *SkipList
 	wal     *wal.WalWriter
-	maxSize int          // maximum size before flush
-	size    int64        // current estimated size (atomic)
-	frozen  int32        // atomic flag: 0 = not frozen, 1 = frozen
-	mu      sync.RWMutex // protects WAL writes (must be sequential)
+	walPath string        // path to the WAL file (for cleanup after flush)
+	maxSize int           // maximum size before flush
+	size    int64         // current estimated size (atomic)
+	frozen  int32         // atomic flag: 0 = not frozen, 1 = frozen
+	mu      sync.RWMutex  // protects WAL writes (must be sequential)
 }
 
 // NewMemtable creates a new memtable with WAL support
@@ -39,6 +40,7 @@ func NewMemtable(walPath string) (*Memtable, error) {
 	mt := &Memtable{
 		sl:      NewSkipList(),
 		wal:     walWriter,
+		walPath: walPath,
 		maxSize: DefaultMaxSize,
 		size:    0,
 		frozen:  0,
@@ -181,4 +183,9 @@ func (mt *Memtable) Close() error {
 // NewIterator creates an iterator for scanning all entries in memtable
 func (mt *Memtable) NewIterator() *SLIterator {
 	return mt.sl.NewIterator()
+}
+
+// WalPath returns the path to the WAL file for this memtable
+func (mt *Memtable) WalPath() string {
+	return mt.walPath
 }

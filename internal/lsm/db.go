@@ -137,14 +137,20 @@ func (db *DB) flushMemtable(mt *memtable.Memtable, walPath string) {
 	// Close memtable (this closes WAL)
 	mt.Close()
 
+	// Delete old WAL file after successful flush
+	// The data is now safely persisted in SSTable, so the WAL is no longer needed.
+	// This prevents WAL files from accumulating on disk.
+	if err := os.Remove(walPath); err != nil {
+		// Log warning but don't fail (WAL deletion is not critical for correctness)
+		// The SSTable already contains the data, so the system can continue operating
+		// TODO: log warning (for now, just continue)
+	}
+
 	// Trigger compaction if needed (outside lock to avoid deadlock)
 	if shouldCompact {
 		db.compactWg.Add(1)
 		go db.compactSSTables()
 	}
-
-	// TODO: Optionally remove old WAL file (os.Remove(walPath))
-	// For now, we'll leave it for debugging
 }
 
 // compactSSTables merges multiple SSTables into one.
@@ -474,12 +480,15 @@ func (db *DB) rotateMemtable() error {
 	// Freeze current active
 	db.active.Freeze()
 
+	// Save the old WAL path before moving to immutable
+	oldWalPath := db.active.WalPath()
+
 	// Move to immutable
 	db.immutable = db.active
 
 	// Create new active with new WAL
-	walPath := filepath.Join(db.dataDir, fmt.Sprintf("active-%d.wal", time.Now().UnixNano()))
-	newActive, err := memtable.NewMemtable(walPath)
+	newWalPath := filepath.Join(db.dataDir, fmt.Sprintf("active-%d.wal", time.Now().UnixNano()))
+	newActive, err := memtable.NewMemtable(newWalPath)
 	if err != nil {
 		// Rollback: unfreeze immutable and restore as active
 		// For simplicity, we'll just return error (in production, handle better)
@@ -488,9 +497,9 @@ func (db *DB) rotateMemtable() error {
 
 	db.active = newActive
 
-	// Start background flush
+	// Start background flush with the old WAL path (the one that should be deleted)
 	db.flushWg.Add(1)
-	go db.flushMemtable(db.immutable, walPath)
+	go db.flushMemtable(db.immutable, oldWalPath)
 
 	return nil
 }
