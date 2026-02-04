@@ -212,3 +212,37 @@ func TestLoadEmptyFile(t *testing.T) {
 		t.Errorf("Expected 0 recovered records, got %d", result.Recovered)
 	}
 }
+
+func TestWriteInvalidSize(t *testing.T) {
+	tmpDir := t.TempDir()
+	walPath := filepath.Join(tmpDir, "test.wal")
+
+	wal, err := NewWalWriter(walPath)
+	if err != nil {
+		t.Fatalf("Failed to create WAL writer: %v", err)
+	}
+	defer wal.Close()
+
+	// Test: Key too large (exceeds maxKeySize)
+	largeKey := make([]byte, maxKeySize+1)
+	err = wal.Write(largeKey, []byte("value"))
+	if err != ErrInvalidSize {
+		t.Errorf("Expected ErrInvalidSize for oversized key, got %v", err)
+	}
+
+	// Test: Value too large (exceeds maxValueSize)
+	err = wal.Write([]byte("key"), make([]byte, maxValueSize+1))
+	if err != ErrInvalidSize {
+		t.Errorf("Expected ErrInvalidSize for oversized value, got %v", err)
+	}
+
+	// Note: The third check (ksiz+vsiz > maxRecordSize-headerSize) is defensive
+	// but won't trigger in practice because maxKeySize + maxValueSize = maxRecordSize - headerSize.
+	// If key or value exceeds their individual limits, the first two checks will catch it.
+
+	// Test: Valid sizes should work
+	err = wal.Write([]byte("key"), []byte("value"))
+	if err != nil {
+		t.Errorf("Valid write should succeed, got %v", err)
+	}
+}

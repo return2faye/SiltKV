@@ -65,6 +65,19 @@ func NewWalWriter(path string) (*WalWriter, error) {
 func (w *WalWriter) Write(key, value []byte) error {
 	ksiz := len(key)
 	vsiz := len(value)
+
+	// Fail Fast: Validate sizes before any allocation or I/O
+	// This prevents silent data loss (write succeeds but can't be recovered)
+	if ksiz > maxKeySize {
+		return ErrInvalidSize
+	}
+	if vsiz > maxValueSize {
+		return ErrInvalidSize
+	}
+	if ksiz+vsiz > maxRecordSize-headerSize {
+		return ErrInvalidSize
+	}
+
 	// Header(12) = CheckSum(4) + kSize(4) + VSize(4)
 	neededSize := headerSize + ksiz + vsiz
 
