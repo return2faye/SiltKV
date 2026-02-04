@@ -9,7 +9,7 @@ import (
 
 // implementation of skiplist
 
-const MaxLevel = 12
+const MaxLevel = 16
 
 /*
 basic structure
@@ -86,7 +86,11 @@ func (sl *SkipList) Put(key, val []byte) {
 		newNode.next[i] = update[i].next[i]
 		update[i].next[i] = newNode
 	}
-	sl.size++
+
+	// if tomebstone, not increase size
+	if val != nil {
+		sl.size++
+	}
 }
 
 func (sl *SkipList) Get(key []byte) ([]byte, bool) {
