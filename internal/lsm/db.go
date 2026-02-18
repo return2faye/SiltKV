@@ -305,43 +305,62 @@ func (db *DB) compactSSTables() {
 	}
 	outputPaths = append(outputPaths, outputPath)
 
-	// Write merged data (keep tombstones for now)
+	// Write merged data
 	written := 0
 	for mergeIt.Valid() {
 		key := mergeIt.Key()
 		value := mergeIt.Value()
 
-		// Check if current file would exceed size limit
-		recordSize := int64(8 + len(key) + len(value))
-		if writer.Size()+recordSize > sstable.MaxSSTableFileSize() && writer.Size() > 0 {
-			// Close current writer and create new one
-			if err := writer.Close(); err != nil {
-				// Cleanup on error
-				for _, p := range outputPaths {
-					os.Remove(p)
+		// Skip tombstones: if value is nil, we don't write it to compacted SSTables.
+		// This is safe because compactSSTables always operates on the oldest N SSTables,
+		// so all older versions of this key are included in this compaction.
+		if value != nil {
+			// Check if current file would exceed size limit
+			recordSize := int64(8 + len(key) + len(value))
+			if writer.Size()+recordSize > sstable.MaxSSTableFileSize() && writer.Size() > 0 {
+				// Close current writer and create new one
+				if err := writer.Close(); err != nil {
+					// Cleanup on error
+					for _, p := range outputPaths {
+						os.Remove(p)
+					}
+					// TODO: log error
+					return
 				}
-				// TODO: log error
-				return
+
+				// Open reader for completed file
+				reader, err := sstable.NewReader(outputPath)
+				if err != nil {
+					// Cleanup on error
+					for _, p := range outputPaths {
+						os.Remove(p)
+					}
+					// TODO: log error
+					return
+				}
+				newReaders = append(newReaders, reader)
+
+				// Create new writer
+				fileCounter++
+				outputPath = filepath.Join(db.dataDir, fmt.Sprintf("compact-%d-%d.sst", baseTimestamp, fileCounter))
+				writer, err = sstable.NewWriter(outputPath)
+				if err != nil {
+					// Cleanup on error
+					for _, r := range newReaders {
+						r.Close()
+					}
+					for _, p := range outputPaths {
+						os.Remove(p)
+					}
+					// TODO: log error
+					return
+				}
+				outputPaths = append(outputPaths, outputPath)
 			}
 
-			// Open reader for completed file
-			reader, err := sstable.NewReader(outputPath)
-			if err != nil {
-				// Cleanup on error
-				for _, p := range outputPaths {
-					os.Remove(p)
-				}
-				// TODO: log error
-				return
-			}
-			newReaders = append(newReaders, reader)
-
-			// Create new writer
-			fileCounter++
-			outputPath = filepath.Join(db.dataDir, fmt.Sprintf("compact-%d-%d.sst", baseTimestamp, fileCounter))
-			writer, err = sstable.NewWriter(outputPath)
-			if err != nil {
-				// Cleanup on error
+			// Write key-value pair (non-tombstone)
+			if _, err := writer.Write(key, value); err != nil {
+				writer.Close()
 				for _, r := range newReaders {
 					r.Close()
 				}
@@ -351,24 +370,8 @@ func (db *DB) compactSSTables() {
 				// TODO: log error
 				return
 			}
-			outputPaths = append(outputPaths, outputPath)
+			written++
 		}
-
-		// Write key-value pair (including tombstones)
-		// Tombstones (nil values) are kept to mark deletions
-		_, err := writer.Write(key, value)
-		if err != nil {
-			writer.Close()
-			for _, r := range newReaders {
-				r.Close()
-			}
-			for _, p := range outputPaths {
-				os.Remove(p)
-			}
-			// TODO: log error
-			return
-		}
-		written++
 
 		if err := mergeIt.Next(); err != nil {
 			break
