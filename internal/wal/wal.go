@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 )
 
 var (
@@ -37,14 +38,20 @@ const (
 type WalWriter struct {
 	mu        sync.Mutex
 	file      *os.File
-	buf       []byte // reusable buffer for Write operations
+	buf       []byte // reusable buffer for encoding a single record
 	headerBuf []byte // reusable buffer for Load header (fixed 12 bytes)
 	dataBuf   []byte // reusable buffer for Load data (grows as needed)
 
-	// Buffered writes for better concurrency
+	// Buffered writes for better throughput
 	writeBuf   []byte // buffer for batched writes
 	bufSize    int    // current buffer size
 	maxBufSize int    // maximum buffer size before flush
+
+	closed   bool
+	asyncErr error // background fsync error (surfaced on Write/Sync)
+
+	stopCh chan struct{}
+	wg     sync.WaitGroup
 }
 
 func NewWalWriter(path string) (*WalWriter, error) {
@@ -52,14 +59,21 @@ func NewWalWriter(path string) (*WalWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &WalWriter{
+	w := &WalWriter{
 		file:       f,
 		buf:        make([]byte, 0, initialBufferSize),     // pre-allocate write buffer capacity
 		headerBuf:  make([]byte, headerSize),               // fixed-size header buffer
 		dataBuf:    make([]byte, 0, initialDataBufferSize), // pre-allocate data buffer capacity
 		writeBuf:   make([]byte, 0, maxWriteBufSize),       // pre-allocate write buffer
 		maxBufSize: maxWriteBufSize,
-	}, nil
+		stopCh:     make(chan struct{}),
+	}
+
+	// Start background fsync loop (time-driven durability)
+	w.wg.Add(1)
+	go w.syncLoop(time.Second)
+
+	return w, nil
 }
 
 func (w *WalWriter) Write(key, value []byte) error {
@@ -78,24 +92,26 @@ func (w *WalWriter) Write(key, value []byte) error {
 		return ErrInvalidSize
 	}
 
-	// Header(12) = CheckSum(4) + kSize(4) + VSize(4)
 	neededSize := headerSize + ksiz + vsiz
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.file == nil {
+	if w.closed || w.file == nil {
 		return ErrClosed
+	}
+	if w.asyncErr != nil {
+		return w.asyncErr
 	}
 
 	// Prepare the record in a reusable buffer under lock.
-	// This ensures concurrent Write calls (if any) don't race
-	// on the shared w.buf slice.
+	// This ensures concurrent Write calls don't race on the shared w.buf slice.
 	if cap(w.buf) < neededSize {
 		w.buf = make([]byte, neededSize)
 	}
 	buf := w.buf[:neededSize]
 
+	// header: checksum(4) | kSize(4) | vSize(4)
 	binary.LittleEndian.PutUint32(buf[4:8], uint32(ksiz))
 	binary.LittleEndian.PutUint32(buf[8:12], uint32(vsiz))
 
@@ -105,11 +121,11 @@ func (w *WalWriter) Write(key, value []byte) error {
 	sum := crc32.ChecksumIEEE(buf[4:])
 	binary.LittleEndian.PutUint32(buf[0:4], sum)
 
-	// Append to buffer
+	// Append encoded record to write buffer
 	w.writeBuf = append(w.writeBuf, buf...)
 	w.bufSize += neededSize
 
-	// Flush if buffer is large enough
+	// Flush to OS page cache if buffer is large enough
 	if w.bufSize >= w.maxBufSize {
 		if err := w.flushBufferLocked(); err != nil {
 			return err
@@ -119,8 +135,8 @@ func (w *WalWriter) Write(key, value []byte) error {
 	return nil
 }
 
-// flushBufferLocked flushes the write buffer to disk
-// Must be called with mu locked
+// flushBufferLocked flushes the write buffer to OS page cache.
+// Must be called with mu held.
 func (w *WalWriter) flushBufferLocked() error {
 	if len(w.writeBuf) == 0 {
 		return nil
@@ -143,8 +159,11 @@ func (w *WalWriter) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.file == nil {
+	if w.closed || w.file == nil {
 		return ErrClosed
+	}
+	if w.asyncErr != nil {
+		return w.asyncErr
 	}
 
 	// Flush any pending buffered writes first
@@ -152,6 +171,7 @@ func (w *WalWriter) Sync() error {
 		return err
 	}
 
+	// Explicit Sync is allowed to block and provides strong durability.
 	return w.file.Sync()
 }
 
@@ -252,16 +272,80 @@ func (w *WalWriter) Load(apply func(k, v []byte)) (*LoadResult, error) {
 // After closing, all operations will return ErrClosed
 func (w *WalWriter) Close() error {
 	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		w.wg.Wait()
+		return nil
+	}
+	w.closed = true
+	// Stop background sync loop
+	close(w.stopCh)
+	w.mu.Unlock()
+
+	// Wait for background goroutine to exit
+	w.wg.Wait()
+
+	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.file == nil {
-		return nil // already closed
+		return nil
 	}
 
-	// Flush any pending buffered writes first
-	w.flushBufferLocked()
+	// Flush pending writes then fsync and close.
+	flushErr := w.flushBufferLocked()
+	syncErr := w.file.Sync()
+	closeErr := w.file.Close()
+	w.file = nil
 
-	err := w.file.Close()
-	w.file = nil // mark as closed
-	return err
+	if flushErr != nil {
+		return flushErr
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
+// syncLoop periodically flushes buffered writes and fsyncs the WAL.
+// It is best-effort: any error is recorded and returned by future Write/Sync calls.
+func (w *WalWriter) syncLoop(interval time.Duration) {
+	defer w.wg.Done()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			w.mu.Lock()
+			if w.closed || w.file == nil {
+				w.mu.Unlock()
+				return
+			}
+			if w.asyncErr != nil {
+				w.mu.Unlock()
+				continue
+			}
+
+			// Ensure data reaches OS page cache before fsync.
+			if err := w.flushBufferLocked(); err != nil {
+				w.asyncErr = err
+				w.mu.Unlock()
+				continue
+			}
+			f := w.file
+			w.mu.Unlock()
+
+			if err := f.Sync(); err != nil {
+				w.mu.Lock()
+				if w.asyncErr == nil {
+					w.asyncErr = err
+				}
+				w.mu.Unlock()
+			}
+		case <-w.stopCh:
+			return
+		}
+	}
 }

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/return2faye/SiltKV/internal/memtable"
 )
 
 // TestWALFileDeletionAfterFlush verifies that WAL files are deleted after successful flush
@@ -26,14 +28,17 @@ func TestWALFileDeletionAfterFlush(t *testing.T) {
 		t.Fatalf("Initial WAL file %s should exist: %v", initialWalPath, err)
 	}
 
-	// Write enough data to fill memtable and trigger flush
-	// DefaultMaxSize is 4MB, so we write ~5MB to ensure flush
-	// Use larger values to reach threshold faster and more reliably
-	valueSize := 10 * 1024 // 10KB per value
-	// Each entry is key (2 bytes) + value (10KB) = ~10KB
-	// To exceed 4MB, we need ~400 entries
-	// We write 500 entries to be safe (~5MB)
-	numKeys := 500
+	// Write enough data to fill memtable and trigger flush.
+	// Use memtable.DefaultMaxSize instead of hardcoding, so the test
+	// stays valid even if the memtable size limit changes.
+	valueSize := 32 * 1024 // 32KB per value
+	entrySize := 2 + valueSize
+	// Target total bytes slightly above DefaultMaxSize to guarantee a flush.
+	targetBytes := int64(memtable.DefaultMaxSize) * 11 / 10 // 1.1x
+	numKeys := int(targetBytes / int64(entrySize))
+	if numKeys < 100 {
+		numKeys = 100
+	}
 
 	flushTriggered := false
 	for i := 0; i < numKeys; i++ {
@@ -164,9 +169,16 @@ func TestMultipleFlushes(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Trigger multiple flushes by writing data multiple times
-	valueSize := 1024
-	numKeysPerFlush := 5000
+	// Trigger multiple flushes by writing data multiple times.
+	// Use memtable.DefaultMaxSize to size writes so that each round
+	// reliably overflows the memtable at least once.
+	valueSize := 16 * 1024 // 16KB per value
+	entrySize := 3 + valueSize
+	targetBytesPerRound := int64(memtable.DefaultMaxSize) * 6 / 5 // 1.2x
+	numKeysPerFlush := int(targetBytesPerRound / int64(entrySize))
+	if numKeysPerFlush < 1000 {
+		numKeysPerFlush = 1000
+	}
 
 	for flushRound := 0; flushRound < 3; flushRound++ {
 		// Write data to trigger flush
