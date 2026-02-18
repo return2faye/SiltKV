@@ -3,6 +3,7 @@ package sstable
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"os"
 
@@ -14,6 +15,12 @@ const (
 	maxSSTableKeySize   = 128        // 128B - maximum key size for SSTable
 	maxSSTableValueSize = 4 * 1024   // 4KB - maximum value size for SSTable
 	maxSSTableFileSize  = 64 << 20   // 64MB - maximum size for a single SSTable file
+)
+
+var (
+	// ErrCorruptSSTable is returned when an SSTable file has an invalid layout
+	// (e.g. missing or malformed footer, invalid offsets, etc.).
+	ErrCorruptSSTable = errors.New("sstable: corrupt file")
 )
 
 // MaxSSTableFileSize returns the maximum size for a single SSTable file.
@@ -273,34 +280,21 @@ func (r *Reader) initialize() error {
 		return nil
 	}
 
+	// All SSTables are required to use the new format with footer/index/bloom.
+	// A valid file must be at least 32 bytes to hold the footer.
 	if r.fileSize < 32 {
-		// Old format or empty file - use legacy mode
-		r.footer = nil
-		r.blockIndex = nil
-		r.bloomFilter = nil
-		r.initialized = true
-		return nil
+		return ErrCorruptSSTable
 	}
 
-	// Read footer (last 32 bytes)
+	// Read footer (last 32 bytes).
 	footerData := make([]byte, 32)
 	if _, err := r.file.ReadAt(footerData, r.fileSize-32); err != nil {
-		// Old format - use legacy mode
-		r.footer = nil
-		r.blockIndex = nil
-		r.bloomFilter = nil
-		r.initialized = true
-		return nil
+		return ErrCorruptSSTable
 	}
 
 	footer, err := DeserializeFooter(footerData)
 	if err != nil {
-		// Old format - use legacy mode
-		r.footer = nil
-		r.blockIndex = nil
-		r.bloomFilter = nil
-		r.initialized = true
-		return nil
+		return ErrCorruptSSTable
 	}
 	r.footer = footer
 
@@ -308,34 +302,19 @@ func (r *Reader) initialize() error {
 	if footer.BlockIndexOffset < 0 || footer.BlockIndexSize < 0 ||
 		footer.BloomFilterOffset < 0 || footer.BlockIndexOffset > r.fileSize ||
 		footer.BloomFilterOffset > r.fileSize {
-		// Invalid footer - use legacy mode
-		r.footer = nil
-		r.blockIndex = nil
-		r.bloomFilter = nil
-		r.initialized = true
-		return nil
+		return ErrCorruptSSTable
 	}
 
 	// Read block index
 	if footer.BlockIndexSize > 0 && footer.BlockIndexOffset+footer.BlockIndexSize <= r.fileSize {
 		blockIndexData := make([]byte, footer.BlockIndexSize)
 		if _, err := r.file.ReadAt(blockIndexData, footer.BlockIndexOffset); err != nil {
-			// Old format - use legacy mode
-			r.footer = nil
-			r.blockIndex = nil
-			r.bloomFilter = nil
-			r.initialized = true
-			return nil
+			return ErrCorruptSSTable
 		}
 
 		blockIndex, err := DeserializeBlockIndex(blockIndexData)
 		if err != nil {
-			// Old format - use legacy mode
-			r.footer = nil
-			r.blockIndex = nil
-			r.bloomFilter = nil
-			r.initialized = true
-			return nil
+			return ErrCorruptSSTable
 		}
 		r.blockIndex = blockIndex
 	}
@@ -346,22 +325,12 @@ func (r *Reader) initialize() error {
 		if bloomFilterSize > 0 && bloomFilterSize < 1024*1024 { // Sanity check: max 1MB
 			bloomFilterData := make([]byte, bloomFilterSize)
 			if _, err := r.file.ReadAt(bloomFilterData, footer.BloomFilterOffset); err != nil {
-				// Old format - use legacy mode
-				r.footer = nil
-				r.blockIndex = nil
-				r.bloomFilter = nil
-				r.initialized = true
-				return nil
+				return ErrCorruptSSTable
 			}
 
 			bloomFilter, err := LoadBloomFilter(bloomFilterData)
 			if err != nil {
-				// Old format - use legacy mode
-				r.footer = nil
-				r.blockIndex = nil
-				r.bloomFilter = nil
-				r.initialized = true
-				return nil
+				return ErrCorruptSSTable
 			}
 			r.bloomFilter = bloomFilter
 		}
@@ -397,11 +366,6 @@ func (r *Reader) Get(key []byte) ([]byte, bool, error) {
 		}
 	}
 
-	// Legacy format: use linear scan
-	if r.footer == nil || r.blockIndex == nil {
-		return r.getLegacy(key)
-	}
-
 	// New format: use Bloom Filter and Block Index
 	// 1. Quick check with Bloom Filter
 	if r.bloomFilter != nil && !r.bloomFilter.MayContain(key) {
@@ -417,35 +381,6 @@ func (r *Reader) Get(key []byte) ([]byte, bool, error) {
 
 	// 3. Search within the block
 	return r.searchInBlock(key, blockOffset)
-}
-
-// getLegacy implements the old linear scan method (for backward compatibility)
-func (r *Reader) getLegacy(key []byte) ([]byte, bool, error) {
-	it := r.NewIterator()
-
-	// Move to the first data
-	if err := it.Next(); err != nil {
-		return nil, false, err
-	}
-
-	// Linear scan
-	for it.Valid() {
-		cmp := bytes.Compare(it.Key(), key)
-		if cmp == 0 {
-			val := utils.CopyBytes(it.Value())
-			return val, true, nil
-		}
-		// Past the target key, terminate
-		if cmp > 0 {
-			return nil, false, nil
-		}
-
-		if err := it.Next(); err != nil {
-			return nil, false, err
-		}
-	}
-
-	return nil, false, nil
 }
 
 // searchInBlock searches for a key within the specified block
