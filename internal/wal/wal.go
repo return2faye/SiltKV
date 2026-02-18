@@ -26,7 +26,7 @@ const (
 	// maxKeySize is the maximum allowed key size (1MB)
 	maxKeySize = 1 << 20
 	// maxValueSize is the maximum allowed value size (10MB)
-	maxValueSize = 10 << 20
+	maxValueSize = 4 << 20
 	// maxRecordSize is the maximum allowed total record size (header + key + value)
 	maxRecordSize = headerSize + maxKeySize + maxValueSize
 	// maxWriteBufSize is the maximum buffer size before forcing a flush (64KB)
