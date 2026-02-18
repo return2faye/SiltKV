@@ -451,7 +451,9 @@ func (r *Reader) getLegacy(key []byte) ([]byte, bool, error) {
 // searchInBlock searches for a key within the specified block
 func (r *Reader) searchInBlock(key []byte, blockOffset int64) ([]byte, bool, error) {
 	// Determine the end position of the block (start of next block or end of data section)
-	blockEnd := r.footer.BloomFilterOffset
+	// Data section ends at the start of the Block Index (not the Bloom Filter).
+	// Layout: [data blocks][block index][bloom filter][footer]
+	blockEnd := r.footer.BlockIndexOffset
 	if len(r.blockIndex.Entries) > 0 {
 		// Find the offset of the next block
 		for _, entry := range r.blockIndex.Entries {
@@ -530,13 +532,13 @@ func (r *Reader) NewIterator() *Iterator {
 
 	// Determine the end position of the data section
 	dataEnd := r.fileSize
-	if r.footer != nil && r.footer.BloomFilterOffset > 0 {
-		// New format: data ends before Bloom Filter
-		// Ensure dataEnd doesn't exceed file size and leaves at least 32 bytes for footer
-		if r.footer.BloomFilterOffset < r.fileSize-32 {
-			dataEnd = r.footer.BloomFilterOffset
+	if r.footer != nil && r.footer.BlockIndexOffset > 0 {
+		// New format: data ends before Block Index (not Bloom Filter).
+		// Layout: [data blocks][block index][bloom filter][footer]
+		// Ensure we don't read into metadata/footer.
+		if r.footer.BlockIndexOffset <= r.fileSize-32 {
+			dataEnd = r.footer.BlockIndexOffset
 		} else if r.fileSize > 32 {
-			// If calculation is problematic, at least ensure we don't read into the footer
 			dataEnd = r.fileSize - 32
 		}
 	}

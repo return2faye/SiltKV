@@ -1,12 +1,14 @@
 package lsm
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/return2faye/SiltKV/internal/memtable"
+	"github.com/return2faye/SiltKV/internal/wal"
 )
 
 // TestWALFileDeletionAfterFlush verifies that WAL files are deleted after successful flush
@@ -217,5 +219,90 @@ func TestMultipleFlushes(t *testing.T) {
 
 	if len(sstFiles) == 0 {
 		t.Error("Expected at least one SSTable file after flushes, but none found")
+	}
+}
+
+func TestRecoveryWithMultipleWALFiles(t *testing.T) {
+	tmpDir := filepath.Join(t.TempDir(), "test-db")
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatalf("Failed to create tmp dir: %v", err)
+	}
+
+	// Simulate a crash during rotation: both an old and a new WAL exist.
+	oldWalPath := filepath.Join(tmpDir, "active.wal")
+	newWalPath := filepath.Join(tmpDir, "active-123.wal")
+
+	w1, err := wal.NewWalWriter(oldWalPath)
+	if err != nil {
+		t.Fatalf("Failed to create old WAL: %v", err)
+	}
+	if err := w1.Write([]byte("k1"), []byte("v1")); err != nil {
+		t.Fatalf("Failed to write old WAL: %v", err)
+	}
+	if err := w1.Write([]byte("k2"), []byte("v2-old")); err != nil {
+		t.Fatalf("Failed to write old WAL: %v", err)
+	}
+	if err := w1.Sync(); err != nil {
+		t.Fatalf("Failed to sync old WAL: %v", err)
+	}
+	if err := w1.Close(); err != nil {
+		t.Fatalf("Failed to close old WAL: %v", err)
+	}
+
+	w2, err := wal.NewWalWriter(newWalPath)
+	if err != nil {
+		t.Fatalf("Failed to create new WAL: %v", err)
+	}
+	// Overwrite k2 in the new WAL (newest wins).
+	if err := w2.Write([]byte("k2"), []byte("v2-new")); err != nil {
+		t.Fatalf("Failed to write new WAL: %v", err)
+	}
+	if err := w2.Write([]byte("k3"), []byte("v3")); err != nil {
+		t.Fatalf("Failed to write new WAL: %v", err)
+	}
+	if err := w2.Sync(); err != nil {
+		t.Fatalf("Failed to sync new WAL: %v", err)
+	}
+	if err := w2.Close(); err != nil {
+		t.Fatalf("Failed to close new WAL: %v", err)
+	}
+
+	db, err := Open(Options{DataDir: tmpDir})
+	if err != nil {
+		t.Fatalf("Failed to open DB: %v", err)
+	}
+	defer db.Close()
+
+	// Old WAL should have been flushed to an SSTable and removed.
+	if _, err := os.Stat(oldWalPath); !os.IsNotExist(err) {
+		t.Fatalf("Expected old WAL to be removed after recovery flush, stat err=%v", err)
+	}
+
+	// Newest WAL should remain as the active WAL.
+	if _, err := os.Stat(newWalPath); err != nil {
+		t.Fatalf("Expected newest WAL to remain, stat err=%v", err)
+	}
+
+	type want struct {
+		k []byte
+		v []byte
+	}
+	cases := []want{
+		{[]byte("k1"), []byte("v1")},
+		{[]byte("k2"), []byte("v2-new")}, // newest wins
+		{[]byte("k3"), []byte("v3")},
+	}
+
+	for _, tc := range cases {
+		got, found, err := db.Get(tc.k)
+		if err != nil {
+			t.Fatalf("Get(%q) error: %v", tc.k, err)
+		}
+		if !found {
+			t.Fatalf("Get(%q) not found", tc.k)
+		}
+		if !bytes.Equal(got, tc.v) {
+			t.Fatalf("Get(%q)=%q, want %q", tc.k, got, tc.v)
+		}
 	}
 }

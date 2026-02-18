@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +41,58 @@ type Options struct {
 	DataDir string
 }
 
+type walSegment struct {
+	path string
+	ts   int64
+}
+
+func listWALSegments(dataDir string) ([]walSegment, error) {
+	matches, err := filepath.Glob(filepath.Join(dataDir, "*.wal"))
+	if err != nil {
+		return nil, err
+	}
+
+	segs := make([]walSegment, 0, len(matches))
+	for _, p := range matches {
+		base := filepath.Base(p)
+
+		// Our WAL naming scheme:
+		// - "active.wal" (initial)
+		// - "active-<unixNano>.wal" (after rotations)
+		var ts int64
+		switch {
+		case base == "active.wal":
+			ts = 0
+		case strings.HasPrefix(base, "active-") && strings.HasSuffix(base, ".wal"):
+			num := strings.TrimSuffix(strings.TrimPrefix(base, "active-"), ".wal")
+			if v, err := strconv.ParseInt(num, 10, 64); err == nil {
+				ts = v
+			} else {
+				// Fallback to file modtime if name can't be parsed.
+				if st, statErr := os.Stat(p); statErr == nil {
+					ts = st.ModTime().UnixNano()
+				}
+			}
+		default:
+			// Unknown WAL name; still recover it. Use modtime ordering.
+			if st, statErr := os.Stat(p); statErr == nil {
+				ts = st.ModTime().UnixNano()
+			}
+		}
+
+		segs = append(segs, walSegment{path: p, ts: ts})
+	}
+
+	sort.Slice(segs, func(i, j int) bool {
+		if segs[i].ts != segs[j].ts {
+			return segs[i].ts < segs[j].ts
+		}
+		return segs[i].path < segs[j].path
+	})
+
+	return segs, nil
+}
+
 func Open(opts Options) (*DB, error) {
 	if opts.DataDir == "" {
 		return nil, os.ErrInvalid
@@ -65,8 +120,20 @@ func Open(opts Options) (*DB, error) {
 		sstables = append(sstables, reader)
 	}
 
-	walPath := filepath.Join(opts.DataDir, "active.wal")
-	mt, err := memtable.NewMemtable(walPath)
+	// Discover WAL segments (crash during rotation may leave multiple WAL files).
+	segs, err := listWALSegments(opts.DataDir)
+	if err != nil {
+		return nil, err
+	}
+
+	// If no WAL exists, create the default active WAL.
+	if len(segs) == 0 {
+		segs = append(segs, walSegment{path: filepath.Join(opts.DataDir, "active.wal"), ts: 0})
+	}
+
+	// The newest WAL segment becomes the active memtable.
+	activeWalPath := segs[len(segs)-1].path
+	mt, err := memtable.NewMemtable(activeWalPath)
 	if err != nil {
 		return nil, err
 	}
@@ -76,6 +143,32 @@ func Open(opts Options) (*DB, error) {
 		active:         mt,
 		sstables:       sstables,
 		compactTrigger: 4,
+	}
+
+	// Any older WAL segments represent data that was not flushed to SSTables yet.
+	// To keep the runtime model simple (active + optional immutable), we flush these
+	// older WAL segments to SSTables during Open and delete them after a successful flush.
+	//
+	// Recovery order matters: old -> new. By flushing older segments first and using the
+	// newest as active, we preserve last-write-wins semantics on reads (active checked first).
+	if len(segs) > 1 {
+		for _, seg := range segs[:len(segs)-1] {
+			oldMt, err := memtable.NewMemtable(seg.path)
+			if err != nil {
+				mt.Close()
+				return nil, err
+			}
+			if err := oldMt.Freeze(); err != nil {
+				oldMt.Close()
+				mt.Close()
+				return nil, err
+			}
+
+			// Flush synchronously during Open to avoid leaving background work
+			// tied to a DB that might be immediately closed by the caller.
+			db.flushWg.Add(1)
+			db.flushMemtable(oldMt, seg.path)
+		}
 	}
 
 	return db, nil
