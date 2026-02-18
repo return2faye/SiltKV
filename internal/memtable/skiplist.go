@@ -9,7 +9,7 @@ import (
 
 // implementation of skiplist
 
-const MaxLevel = 16
+const MaxLevel = 32
 
 /*
 basic structure
