@@ -12,7 +12,7 @@ import (
 const (
 	// DefaultMaxSize is the default maximum size for memtable (4MB)
 	// When memtable reaches this size, it should be flushed to SSTable
-	DefaultMaxSize = 4 << 20
+	DefaultMaxSize = 64 << 20
 )
 
 var ErrFrozen = errors.New("memtable: frozen")
@@ -21,11 +21,11 @@ var ErrFrozen = errors.New("memtable: frozen")
 type Memtable struct {
 	sl      *SkipList
 	wal     *wal.WalWriter
-	walPath string        // path to the WAL file (for cleanup after flush)
-	maxSize int           // maximum size before flush
-	size    int64         // current estimated size (atomic)
-	frozen  int32         // atomic flag: 0 = not frozen, 1 = frozen
-	mu      sync.RWMutex  // protects WAL writes (must be sequential)
+	walPath string       // path to the WAL file (for cleanup after flush)
+	maxSize int          // maximum size before flush
+	size    int64        // current estimated size (atomic)
+	frozen  int32        // atomic flag: 0 = not frozen, 1 = frozen
+	mu      sync.RWMutex // protects WAL writes (must be sequential)
 }
 
 // NewMemtable creates a new memtable with WAL support
