@@ -24,10 +24,10 @@ const (
 	headerSize = 12
 	// initialDataBufferSize is the initial capacity for the reusable data buffer in Load
 	initialDataBufferSize = 1024
-	// maxKeySize is the maximum allowed key size (1MB)
-	maxKeySize = 1 << 20
-	// maxValueSize is the maximum allowed value size (10MB)
-	maxValueSize = 4 << 20
+	// maxKeySize is the maximum allowed key size (128B, tuned for web workloads)
+	maxKeySize = 128
+	// maxValueSize is the maximum allowed value size (4KB, compressed JSON payload)
+	maxValueSize = 4 * 1024
 	// maxRecordSize is the maximum allowed total record size (header + key + value)
 	maxRecordSize = headerSize + maxKeySize + maxValueSize
 	// maxWriteBufSize is the maximum buffer size before forcing a flush (64KB)

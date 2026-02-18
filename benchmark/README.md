@@ -40,7 +40,7 @@ go tool pprof mem.prof
 - **BenchmarkSequentialWrite**: Measures sequential write performance
 - **BenchmarkRandomRead**: Measures random read performance
 - **BenchmarkDelete**: Measures delete performance
-- **BenchmarkWriteLargeValues**: Measures performance with large values (10KB)
+- **BenchmarkWriteLargeValues**: Measures performance with large values (~4KB, web JSON payloads)
 - **BenchmarkWriteSmallValues**: Measures performance with small values
 - **BenchmarkConcurrentWrites**: Measures concurrent write performance
 - **BenchmarkConcurrentReads**: Measures concurrent read performance
@@ -51,17 +51,17 @@ Current benchmark results (Apple M4 Pro, Go 1.x):
 
 | Benchmark | Performance | Memory | Allocations |
 |-----------|-------------|--------|-------------|
-| **BenchmarkPut** | 364.7 ns/op | 136 B/op | 4 allocs/op |
-| **BenchmarkGet** | 104.6 ns/op | 38 B/op | 3 allocs/op |
-| **BenchmarkGetFromSSTable** | 140.5 ns/op | 240 B/op | 3 allocs/op |
-| **BenchmarkPutGet** | 481.4 ns/op | 236 B/op | 7 allocs/op |
-| **BenchmarkSequentialWrite** | 575.4 ns/op | 205 B/op | 8 allocs/op |
-| **BenchmarkRandomRead** | 223.5 ns/op | 48 B/op | 3 allocs/op |
-| **BenchmarkDelete** | 570.5 ns/op | 122 B/op | 3 allocs/op |
-| **BenchmarkWriteLargeValues** (10KB) | 29,267 ns/op | 22,108 B/op | 21 allocs/op |
-| **BenchmarkWriteSmallValues** | 432.6 ns/op | 167 B/op | 8 allocs/op |
-| **BenchmarkConcurrentWrites** | 585.4 ns/op | 73 B/op | 5 allocs/op |
-| **BenchmarkConcurrentReads** | 319.9 ns/op | 51 B/op | 4 allocs/op |
+| **BenchmarkPut** | 354.3 ns/op | 129 B/op | 4 allocs/op |
+| **BenchmarkGet** | 93.17 ns/op | 38 B/op | 3 allocs/op |
+| **BenchmarkGetFromSSTable** | 131.7 ns/op | 240 B/op | 3 allocs/op |
+| **BenchmarkPutGet** | 532.0 ns/op | 176 B/op | 7 allocs/op |
+| **BenchmarkSequentialWrite** | 420.0 ns/op | 179 B/op | 8 allocs/op |
+| **BenchmarkRandomRead** | 212.1 ns/op | 48 B/op | 3 allocs/op |
+| **BenchmarkDelete** | 347.7 ns/op | 88 B/op | 2 allocs/op |
+| **BenchmarkWriteLargeValues** (~4KB) | 4897 ns/op | 6496 B/op | 11 allocs/op |
+| **BenchmarkWriteSmallValues** | 437.8 ns/op | 160 B/op | 7 allocs/op |
+| **BenchmarkConcurrentWrites** | 598.8 ns/op | 72 B/op | 5 allocs/op |
+| **BenchmarkConcurrentReads** | 304.3 ns/op | 51 B/op | 4 allocs/op |
 
 ### Performance Highlights
 

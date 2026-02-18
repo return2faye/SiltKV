@@ -218,13 +218,13 @@ func BenchmarkDelete(b *testing.B) {
 	}
 }
 
-// BenchmarkWriteLargeValues measures performance with large values
+// BenchmarkWriteLargeValues measures performance with large values (web payloads)
 func BenchmarkWriteLargeValues(b *testing.B) {
 	db, _ := setupDB(b)
 	defer db.Close()
 
-	// Generate large value (10KB)
-	largeValue := make([]byte, 10*1024)
+	// Generate large value (~4KB compressed JSON)
+	largeValue := make([]byte, 4*1024)
 	for i := range largeValue {
 		largeValue[i] = byte(i % 256)
 	}

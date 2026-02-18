@@ -33,7 +33,8 @@ func TestWALFileDeletionAfterFlush(t *testing.T) {
 	// Write enough data to fill memtable and trigger flush.
 	// Use memtable.DefaultMaxSize instead of hardcoding, so the test
 	// stays valid even if the memtable size limit changes.
-	valueSize := 32 * 1024 // 32KB per value
+	// Each value is ~2KB, aligned with typical web JSON payloads.
+	valueSize := 2 * 1024 // 2KB per value
 	entrySize := 2 + valueSize
 	// Target total bytes slightly above DefaultMaxSize to guarantee a flush.
 	targetBytes := int64(memtable.DefaultMaxSize) * 11 / 10 // 1.1x
@@ -174,7 +175,8 @@ func TestMultipleFlushes(t *testing.T) {
 	// Trigger multiple flushes by writing data multiple times.
 	// Use memtable.DefaultMaxSize to size writes so that each round
 	// reliably overflows the memtable at least once.
-	valueSize := 16 * 1024 // 16KB per value
+	// Each value is ~2KB, aligned with typical web JSON payloads.
+	valueSize := 2 * 1024 // 2KB per value
 	entrySize := 3 + valueSize
 	targetBytesPerRound := int64(memtable.DefaultMaxSize) * 6 / 5 // 1.2x
 	numKeysPerFlush := int(targetBytesPerRound / int64(entrySize))

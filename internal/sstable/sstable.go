@@ -11,9 +11,9 @@ import (
 )
 
 const (
-	maxSSTableKeySize   = 1 << 20  // 1MB
-	maxSSTableValueSize = 4 << 20  // 4MB
-	maxSSTableFileSize  = 64 << 20 // 64MB - maximum size for a single SSTable file
+	maxSSTableKeySize   = 128        // 128B - maximum key size for SSTable
+	maxSSTableValueSize = 4 * 1024   // 4KB - maximum value size for SSTable
+	maxSSTableFileSize  = 64 << 20   // 64MB - maximum size for a single SSTable file
 )
 
 // MaxSSTableFileSize returns the maximum size for a single SSTable file.
