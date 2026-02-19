@@ -89,28 +89,20 @@ func TestIteratorCorruption(t *testing.T) {
 	tmpDir := t.TempDir()
 	sstPath := filepath.Join(tmpDir, "corrupted.sst")
 
-	// Create a file with invalid header (too short)
+	// Create a file with invalid format (too short, no valid footer)
 	f, err := os.Create(sstPath)
 	if err != nil {
 		t.Fatalf("Failed to create file: %v", err)
 	}
-	// Write only 4 bytes instead of 8
 	f.Write([]byte{0x01, 0x00, 0x00, 0x00})
 	f.Close()
 
-	reader, err := NewReader(sstPath)
-	if err != nil {
-		t.Fatalf("Failed to create reader: %v", err)
+	_, err = NewReader(sstPath)
+	if err == nil {
+		t.Fatal("NewReader should fail on corrupt file")
 	}
-	defer reader.Close()
-
-	it := reader.NewIterator()
-	err = it.Next()
-	if err != nil {
-		t.Fatalf("Next should handle incomplete header gracefully, got: %v", err)
-	}
-	if it.Valid() {
-		t.Error("Iterator should be invalid after incomplete header")
+	if err != ErrCorruptSSTable {
+		t.Errorf("Expected ErrCorruptSSTable, got: %v", err)
 	}
 }
 
@@ -118,12 +110,14 @@ func TestEmptySSTable(t *testing.T) {
 	tmpDir := t.TempDir()
 	sstPath := filepath.Join(tmpDir, "empty.sst")
 
-	// Create empty file
-	f, err := os.Create(sstPath)
+	// Create a valid but empty SSTable via Writer (has footer/index/bloom)
+	writer, err := NewWriter(sstPath)
 	if err != nil {
-		t.Fatalf("Failed to create empty file: %v", err)
+		t.Fatalf("Failed to create writer: %v", err)
 	}
-	f.Close()
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Failed to close writer: %v", err)
+	}
 
 	reader, err := NewReader(sstPath)
 	if err != nil {
@@ -140,7 +134,6 @@ func TestEmptySSTable(t *testing.T) {
 		t.Error("Iterator should be invalid for empty file")
 	}
 
-	// Get should return not found
 	_, found, err := reader.Get([]byte("anykey"))
 	if err != nil {
 		t.Fatalf("Get on empty file should succeed, got: %v", err)

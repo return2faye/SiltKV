@@ -43,7 +43,8 @@ type Writer struct {
 	bloomFilter     *BloomFilter // Bloom filter for fast key existence check
 	currentBlock    []byte       // Current block buffer being written
 	blockOffset     int64        // Starting offset of the current block
-	firstKeyInBlock []byte       // First key in the current block
+	firstKeyInBlock []byte       // First key in the current block (for block start)
+	lastKeyInBlock  []byte       // Last key in the current block (for sparse index)
 }
 
 func NewWriter(path string) (*Writer, error) {
@@ -59,6 +60,7 @@ func NewWriter(path string) (*Writer, error) {
 		currentBlock:    make([]byte, 0, BlockSize),
 		blockOffset:     0,
 		firstKeyInBlock: nil,
+		lastKeyInBlock:  nil,
 	}, nil
 }
 
@@ -76,9 +78,9 @@ func (w *Writer) flushCurrentBlock() error {
 		return err
 	}
 
-	// If there's a first key, add it to the Block Index
-	if w.firstKeyInBlock != nil {
-		w.blockIndex.Add(w.firstKeyInBlock, blockOffset)
+	// Add this block's last key to the sparse index (last key is better for lookup)
+	if w.lastKeyInBlock != nil {
+		w.blockIndex.Add(w.lastKeyInBlock, blockOffset)
 	}
 
 	// Update file size
@@ -87,6 +89,7 @@ func (w *Writer) flushCurrentBlock() error {
 	// Reset current block (preserve capacity)
 	w.currentBlock = w.currentBlock[:0]
 	w.firstKeyInBlock = nil
+	w.lastKeyInBlock = nil
 	w.blockOffset = w.fileSize
 
 	return nil
@@ -99,10 +102,11 @@ func (w *Writer) writeRecordToBlock(key, value []byte) (bool, error) {
 	vlen := uint32(len(value))
 	recordSize := 8 + len(key) + len(value)
 
-	// If this is the first key in the block, save it
 	if w.firstKeyInBlock == nil {
 		w.firstKeyInBlock = utils.CopyBytes(key)
 	}
+	// Always update last key in block (used for sparse index)
+	w.lastKeyInBlock = utils.CopyBytes(key)
 
 	// Check if the record can fit in the current block
 	if len(w.currentBlock)+recordSize > BlockSize && len(w.currentBlock) > 0 {
@@ -467,11 +471,10 @@ func (r *Reader) NewIterator() *Iterator {
 
 	// Determine the end position of the data section
 	dataEnd := r.fileSize
-	if r.footer != nil && r.footer.BlockIndexOffset > 0 {
-		// New format: data ends before Block Index (not Bloom Filter).
+	if r.footer != nil {
+		// New format: data ends before Block Index.
 		// Layout: [data blocks][block index][bloom filter][footer]
-		// Ensure we don't read into metadata/footer.
-		if r.footer.BlockIndexOffset <= r.fileSize-32 {
+		if r.footer.BlockIndexOffset >= 0 && r.footer.BlockIndexOffset <= r.fileSize-32 {
 			dataEnd = r.footer.BlockIndexOffset
 		} else if r.fileSize > 32 {
 			dataEnd = r.fileSize - 32

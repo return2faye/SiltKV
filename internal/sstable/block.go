@@ -16,42 +16,45 @@ const (
 )
 
 // BlockIndexEntry represents an entry in the block index.
-// It stores the first key of a block and the offset where the block starts.
+// It stores the last key of a block and the offset where the block starts.
 type BlockIndexEntry struct {
-	FirstKey []byte // First key in the block
-	Offset   int64  // Offset of the block in the file
+	LastKey []byte // Last key in the block
+	Offset  int64  // Offset of the block in the file
 }
 
-// BlockIndex is a sparse index that maps block first keys to block offsets.
+// BlockIndex is a sparse index that maps block last keys to block offsets.
 type BlockIndex struct {
 	Entries []BlockIndexEntry
 }
 
-// Add adds a new entry to the block index.
-func (bi *BlockIndex) Add(firstKey []byte, offset int64) {
+// Add adds a new entry to the block index (lastKey of the block, offset).
+func (bi *BlockIndex) Add(lastKey []byte, offset int64) {
 	bi.Entries = append(bi.Entries, BlockIndexEntry{
-		FirstKey: utils.CopyBytes(firstKey),
-		Offset:   offset,
+		LastKey: utils.CopyBytes(lastKey),
+		Offset:  offset,
 	})
 }
 
 // FindBlock finds the block that might contain the given key.
 // Returns the offset of the block, or -1 if no block could contain the key.
+// Uses last key: we want the first block whose lastKey >= key.
 func (bi *BlockIndex) FindBlock(key []byte) int64 {
-	// Binary search for the block
-	// We want the last block whose first key <= target key
+	if len(bi.Entries) == 0 {
+		return -1
+	}
+	// Binary search: first entry where LastKey >= key
 	left, right := 0, len(bi.Entries)-1
 	result := int64(-1)
 
 	for left <= right {
 		mid := (left + right) / 2
-		cmp := bytes.Compare(bi.Entries[mid].FirstKey, key)
-		if cmp <= 0 {
-			// This block might contain the key
+		cmp := bytes.Compare(bi.Entries[mid].LastKey, key)
+		if cmp >= 0 {
+			// This block's range extends up to lastKey >= key, so it might contain key
 			result = bi.Entries[mid].Offset
-			left = mid + 1
-		} else {
 			right = mid - 1
+		} else {
+			left = mid + 1
 		}
 	}
 
@@ -69,9 +72,9 @@ func (bi *BlockIndex) Serialize() []byte {
 
 	// Write each entry
 	for _, entry := range bi.Entries {
-		keyLen := uint32(len(entry.FirstKey))
+		keyLen := uint32(len(entry.LastKey))
 		binary.Write(&buf, binary.LittleEndian, keyLen)
-		buf.Write(entry.FirstKey)
+		buf.Write(entry.LastKey)
 		binary.Write(&buf, binary.LittleEndian, entry.Offset)
 	}
 
@@ -115,8 +118,8 @@ func DeserializeBlockIndex(data []byte) (*BlockIndex, error) {
 		}
 
 		index.Entries = append(index.Entries, BlockIndexEntry{
-			FirstKey: key,
-			Offset:   offset,
+			LastKey: key,
+			Offset:  offset,
 		})
 	}
 
