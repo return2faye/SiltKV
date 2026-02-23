@@ -115,31 +115,53 @@ func BenchmarkGetFromSSTable(b *testing.B) {
 	}
 }
 
-// BenchmarkPutGet measures mixed Put and Get operations
-func BenchmarkPutGet(b *testing.B) {
+// BenchmarkMixedReadWrite measures mixed read/write with 30% writes and 70% reads.
+// Pre-populates data so reads hit existing keys; writes insert new keys.
+func BenchmarkMixedReadWrite(b *testing.B) {
 	db, _ := setupDB(b)
 	defer db.Close()
 
-	// Pre-generate keys and values
-	keys := make([]string, b.N)
-	values := make([]string, b.N)
+	// Pre-populate so reads can hit existing keys
+	numPreload := 10000
+	for i := 0; i < numPreload; i++ {
+		key := fmt.Sprintf("key-%08d", i)
+		value := fmt.Sprintf("value-%08d", i)
+		if err := db.Put(key, value); err != nil {
+			b.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	// Pre-generate operation list: 30% write, 70% read
+	rng := rand.New(rand.NewSource(42))
+	type op struct {
+		isWrite bool
+		key     string
+		value   string
+	}
+	ops := make([]op, b.N)
+	writeIdx := numPreload
 	for i := 0; i < b.N; i++ {
-		keys[i] = fmt.Sprintf("key-%d", i)
-		values[i] = fmt.Sprintf("value-%d", i)
+		if rng.Intn(100) < 30 {
+			ops[i] = op{isWrite: true, key: fmt.Sprintf("key-%08d", writeIdx), value: fmt.Sprintf("value-%08d", writeIdx)}
+			writeIdx++
+		} else {
+			ops[i] = op{isWrite: false, key: fmt.Sprintf("key-%08d", rng.Intn(numPreload))}
+		}
 	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		// Put
-		if err := db.Put(keys[i], values[i]); err != nil {
-			b.Fatalf("Put failed: %v", err)
-		}
-		// Get
-		_, err := db.Get(keys[i])
-		if err != nil {
-			b.Fatalf("Get failed: %v", err)
+		if ops[i].isWrite {
+			if err := db.Put(ops[i].key, ops[i].value); err != nil {
+				b.Fatalf("Put failed: %v", err)
+			}
+		} else {
+			_, err := db.Get(ops[i].key)
+			if err != nil && err != kv.ErrNotFound {
+				b.Fatalf("Get failed: %v", err)
+			}
 		}
 	}
 }
