@@ -76,10 +76,10 @@ func TestSkipListDelete(t *testing.T) {
 	// Delete it (tombstone: Put with nil value)
 	sl.Put([]byte("key1"), nil)
 
-	// Verify it's gone (Get returns false for tombstone)
-	_, found = sl.Get([]byte("key1"))
-	if found {
-		t.Error("Key should not be found after delete (tombstone)")
+	// Internal lookups must expose the tombstone so older SSTable values stay hidden.
+	val, found = sl.Get([]byte("key1"))
+	if !found || val != nil {
+		t.Error("Get should return a found tombstone")
 	}
 }
 

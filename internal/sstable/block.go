@@ -11,8 +11,9 @@ import (
 const (
 	// BlockSize is the target size for each data block (4KB)
 	BlockSize = 4 * 1024
-	// MagicNumber is used to identify valid SSTable files
-	MagicNumber = 0x53494C544B56 // "SILTKV" in ASCII
+	// MagicNumber identifies the checksummed SSTable format.
+	MagicNumber       = 0x53494C544B5632 // "SILTKV2" in ASCII
+	legacyMagicNumber = 0x53494C544B56   // "SILTKV" in ASCII
 )
 
 // BlockIndexEntry represents an entry in the block index.
@@ -158,7 +159,7 @@ func DeserializeFooter(data []byte) (*Footer, error) {
 	}
 
 	// Verify magic number
-	if footer.MagicNumber != MagicNumber {
+	if footer.MagicNumber != MagicNumber && footer.MagicNumber != legacyMagicNumber {
 		return nil, io.ErrUnexpectedEOF
 	}
 

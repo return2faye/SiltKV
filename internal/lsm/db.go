@@ -16,10 +16,15 @@ import (
 	"github.com/return2faye/SiltKV/internal/utils"
 )
 
-var ErrClosed = errors.New("lsm: db is closed")
+var (
+	ErrClosed     = errors.New("lsm: db is closed")
+	ErrEmptyValue = errors.New("lsm: empty values are reserved for tombstones")
+)
 
 type DB struct {
-	mu sync.RWMutex
+	mu            sync.RWMutex
+	closed        bool
+	backgroundErr error
 
 	active    *memtable.Memtable
 	immutable *memtable.Memtable
@@ -34,6 +39,7 @@ type DB struct {
 
 	// compaction coordination
 	compactWg      sync.WaitGroup
+	compactMu      sync.Mutex
 	compactTrigger int // number of SSTables before triggering compaction
 }
 
@@ -113,9 +119,10 @@ func Open(opts Options) (*DB, error) {
 	for i := len(sstPaths) - 1; i >= 0; i-- {
 		reader, err := sstable.NewReader(sstPaths[i])
 		if err != nil {
-			// Log error but continue (SSTable might be corrupted or deleted)
-			// In production, you might want to handle this better
-			continue
+			for _, opened := range sstables {
+				opened.Close()
+			}
+			return nil, fmt.Errorf("open SSTable %q: %w", sstPaths[i], err)
 		}
 		sstables = append(sstables, reader)
 	}
@@ -168,10 +175,31 @@ func Open(opts Options) (*DB, error) {
 			// tied to a DB that might be immediately closed by the caller.
 			db.flushWg.Add(1)
 			db.flushMemtable(oldMt, seg.path)
+			if err := db.getBackgroundError(); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
 		}
 	}
 
 	return db, nil
+}
+
+func (db *DB) setBackgroundError(err error) {
+	if err == nil {
+		return
+	}
+	db.mu.Lock()
+	if db.backgroundErr == nil {
+		db.backgroundErr = err
+	}
+	db.mu.Unlock()
+}
+
+func (db *DB) getBackgroundError() error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.backgroundErr
 }
 
 // flushMemtable flushes an immutable memtable to disk as an SSTable.
@@ -181,62 +209,77 @@ func (db *DB) flushMemtable(mt *memtable.Memtable, walPath string) {
 
 	// Generate SSTable file path
 	sstPath := walPath[:len(walPath)-4] + ".sst" // replace .wal with .sst
+	fail := func(err error) {
+		db.setBackgroundError(fmt.Errorf("flush %q: %w", filepath.Base(walPath), err))
+	}
+	discardSSTable := func() {
+		_ = os.Remove(sstPath)
+	}
 
 	// Create writer and flush
 	writer, err := sstable.NewWriter(sstPath)
 	if err != nil {
-		// TODO: log error (for now, just return)
+		fail(err)
 		return
 	}
 
 	it := mt.NewIterator()
 	if err := writer.WriteFromIterator(it); err != nil {
-		writer.Close()
-		// TODO: log error
+		_ = writer.Close()
+		discardSSTable()
+		fail(err)
 		return
 	}
 
 	if err := writer.Close(); err != nil {
-		// TODO: log error
+		discardSSTable()
+		fail(err)
+		return
+	}
+	if err := syncDir(db.dataDir); err != nil {
+		discardSSTable()
+		fail(err)
 		return
 	}
 
 	// Open reader for the new SSTable
 	reader, err := sstable.NewReader(sstPath)
 	if err != nil {
-		// TODO: log error
+		discardSSTable()
+		fail(err)
 		return
 	}
 
-	// Register SSTable reader (newest first)
+	if err := appendToManifest(db.dataDir, sstPath); err != nil {
+		_ = reader.Close()
+		// append may have reached disk before fsync failed, so retain both the
+		// referenced SSTable and WAL for safe recovery.
+		fail(err)
+		return // keep the immutable memtable and WAL recoverable
+	}
+
+	// Register only after the durable manifest references the durable SSTable.
 	db.mu.Lock()
 	db.sstables = append([]*sstable.Reader{reader}, db.sstables...)
-
-	// clear immutable since flushed
 	if db.immutable == mt {
 		db.immutable = nil
 	}
-
-	// Check if compaction is needed after adding new SSTable
-	shouldCompact := len(db.sstables) >= db.compactTrigger
+	shouldCompact := !db.closed && len(db.sstables) >= db.compactTrigger
 	db.mu.Unlock()
 
-	// Update manifest (outside lock, I/O operation)
-	if err := appendToManifest(db.dataDir, sstPath); err != nil {
-		// TODO: log error (for now, just continue)
-		// In production, you might want to handle this better
-	}
-
 	// Close memtable (this closes WAL)
-	mt.Close()
+	if err := mt.Close(); err != nil {
+		fail(err)
+		return
+	}
 
 	// Delete old WAL file after successful flush
 	// The data is now safely persisted in SSTable, so the WAL is no longer needed.
 	// This prevents WAL files from accumulating on disk.
 	if err := os.Remove(walPath); err != nil {
-		// Log warning but don't fail (WAL deletion is not critical for correctness)
-		// The SSTable already contains the data, so the system can continue operating
-		// TODO: log warning (for now, just continue)
+		// The manifest already references the SSTable; a stale WAL is recoverable.
+	} else {
+		_ = syncDir(db.dataDir)
 	}
 
 	// Trigger compaction if needed (outside lock to avoid deadlock)
@@ -251,6 +294,8 @@ func (db *DB) flushMemtable(mt *memtable.Memtable, walPath string) {
 // Only the oldest N SSTables are compacted (newest SSTables are preserved).
 func (db *DB) compactSSTables() {
 	defer db.compactWg.Done()
+	db.compactMu.Lock()
+	defer db.compactMu.Unlock()
 
 	// Get SSTables to compact (hold lock briefly)
 	db.mu.Lock()
@@ -286,27 +331,43 @@ func (db *DB) compactSSTables() {
 	// Create merge iterator
 	mergeIt, err := sstable.NewMergeIterator(readersToCompact)
 	if err != nil {
-		// TODO: log error
+		db.setBackgroundError(fmt.Errorf("compaction: %w", err))
 		return
 	}
 
 	// Write merged data, splitting into multiple SSTables if needed
 	var newReaders []*sstable.Reader
 	var outputPaths []string
+	var writer *sstable.Writer
+	cleanup := func() {
+		if writer != nil {
+			_ = writer.Close()
+			writer = nil
+		}
+		for _, r := range newReaders {
+			_ = r.Close()
+		}
+		for _, p := range outputPaths {
+			_ = os.Remove(p)
+		}
+	}
+	fail := func(err error) {
+		cleanup()
+		db.setBackgroundError(fmt.Errorf("compaction: %w", err))
+	}
 	fileCounter := 0
 	baseTimestamp := time.Now().UnixNano()
 
 	// Create first writer
 	outputPath := filepath.Join(db.dataDir, fmt.Sprintf("compact-%d-%d.sst", baseTimestamp, fileCounter))
-	writer, err := sstable.NewWriter(outputPath)
+	writer, err = sstable.NewWriter(outputPath)
 	if err != nil {
-		// TODO: log error
+		fail(err)
 		return
 	}
 	outputPaths = append(outputPaths, outputPath)
 
 	// Write merged data
-	written := 0
 	for mergeIt.Valid() {
 		key := mergeIt.Key()
 		value := mergeIt.Value()
@@ -320,22 +381,16 @@ func (db *DB) compactSSTables() {
 			if writer.Size()+recordSize > sstable.MaxSSTableFileSize() && writer.Size() > 0 {
 				// Close current writer and create new one
 				if err := writer.Close(); err != nil {
-					// Cleanup on error
-					for _, p := range outputPaths {
-						os.Remove(p)
-					}
-					// TODO: log error
+					writer = nil
+					fail(err)
 					return
 				}
+				writer = nil
 
 				// Open reader for completed file
 				reader, err := sstable.NewReader(outputPath)
 				if err != nil {
-					// Cleanup on error
-					for _, p := range outputPaths {
-						os.Remove(p)
-					}
-					// TODO: log error
+					fail(err)
 					return
 				}
 				newReaders = append(newReaders, reader)
@@ -345,14 +400,7 @@ func (db *DB) compactSSTables() {
 				outputPath = filepath.Join(db.dataDir, fmt.Sprintf("compact-%d-%d.sst", baseTimestamp, fileCounter))
 				writer, err = sstable.NewWriter(outputPath)
 				if err != nil {
-					// Cleanup on error
-					for _, r := range newReaders {
-						r.Close()
-					}
-					for _, p := range outputPaths {
-						os.Remove(p)
-					}
-					// TODO: log error
+					fail(err)
 					return
 				}
 				outputPaths = append(outputPaths, outputPath)
@@ -360,66 +408,44 @@ func (db *DB) compactSSTables() {
 
 			// Write key-value pair (non-tombstone)
 			if _, err := writer.Write(key, value); err != nil {
-				writer.Close()
-				for _, r := range newReaders {
-					r.Close()
-				}
-				for _, p := range outputPaths {
-					os.Remove(p)
-				}
-				// TODO: log error
+				fail(err)
 				return
 			}
-			written++
 		}
 
 		if err := mergeIt.Next(); err != nil {
-			break
+			fail(err)
+			return
 		}
 	}
 
 	// Close last writer
 	if err := writer.Close(); err != nil {
-		for _, r := range newReaders {
-			r.Close()
-		}
-		for _, p := range outputPaths {
-			os.Remove(p)
-		}
-		// TODO: log error
+		writer = nil
+		fail(err)
 		return
 	}
+	writer = nil
 
 	// Open reader for last file
 	lastReader, err := sstable.NewReader(outputPath)
 	if err != nil {
-		for _, r := range newReaders {
-			r.Close()
-		}
-		for _, p := range outputPaths {
-			os.Remove(p)
-		}
-		// TODO: log error
+		fail(err)
 		return
 	}
 	newReaders = append(newReaders, lastReader)
+	if err := syncDir(db.dataDir); err != nil {
+		fail(err)
+		return
+	}
 
-	// Replace old SSTables with new one
+	// Publish the new set in the manifest before removing any old file.
 	db.mu.Lock()
 	// Check if sstables list has changed significantly (another compaction might have happened)
 	// We check if the old SSTables we're trying to replace still exist at the end
 	if len(db.sstables) < len(readersToCompact) {
-		// SSTables were removed by another compaction, abort
-		for _, r := range newReaders {
-			r.Close()
-		}
-		for _, r := range readersToCompact {
-			r.Close()
-		}
 		db.mu.Unlock()
-		for _, p := range outputPaths {
-			os.Remove(p)
-		}
+		cleanup()
 		return
 	}
 
@@ -436,56 +462,37 @@ func (db *DB) compactSSTables() {
 	}
 
 	if !stillMatch {
-		// SSTables were changed, abort
-		for _, r := range newReaders {
-			r.Close()
-		}
-		for _, r := range readersToCompact {
-			r.Close()
-		}
 		db.mu.Unlock()
-		for _, p := range outputPaths {
-			os.Remove(p)
-		}
+		cleanup()
 		return
 	}
 
-	// Close old readers
+	replacement := append([]*sstable.Reader(nil), db.sstables[:currentStartIdx]...)
+	replacement = append(replacement, newReaders...)
+	// The manifest is oldest-first; the in-memory slice is newest-first.
+	manifestPaths := make([]string, len(replacement))
+	for i, r := range replacement {
+		manifestPaths[len(replacement)-1-i] = r.Path()
+	}
+	if err := rewriteManifest(db.dataDir, manifestPaths); err != nil {
+		db.mu.Unlock()
+		fail(err)
+		return
+	}
+
+	db.sstables = replacement
 	for _, r := range readersToCompact {
 		r.Close()
 	}
-
-	// Replace only the compacted SSTables with new ones
-	// Merged SSTables should be placed at the position of the old SSTables they replaced
-	// (not at the front, because they contain old data, not new data)
-	db.sstables = append(
-		db.sstables[:currentStartIdx], // Keep newer SSTables at the front
-		newReaders...,                 // Place merged SSTables where old ones were
-	)
-
-	// Get all current SSTable paths for manifest rewrite
-	currentPaths := make([]string, len(db.sstables))
-	for i, r := range db.sstables {
-		currentPaths[i] = r.Path()
-	}
-
-	// Check if we need to trigger another compaction
-	shouldCompactAgain := len(db.sstables) >= db.compactTrigger
+	// ponytail: count-based compaction stops if splitting cannot reduce file
+	// count; add levels only when sustained large datasets prove this ceiling.
+	shouldCompactAgain := !db.closed && len(newReaders) < len(readersToCompact) && len(db.sstables) >= db.compactTrigger
 	db.mu.Unlock()
 
-	// Delete old SSTable files (outside lock)
 	for _, path := range oldPaths {
-		if err := os.Remove(path); err != nil {
-			// TODO: log error (file might already be deleted)
-		}
+		_ = os.Remove(path)
 	}
-
-	// Rewrite manifest with current SSTable list
-	if err := rewriteManifest(db.dataDir, currentPaths); err != nil {
-		// TODO: log error
-		// Manifest update failed, but compaction succeeded
-		// Next Open will rebuild manifest from disk
-	}
+	_ = syncDir(db.dataDir)
 
 	// Trigger another compaction if needed (outside lock to avoid deadlock)
 	if shouldCompactAgain {
@@ -496,15 +503,23 @@ func (db *DB) compactSSTables() {
 
 func (db *DB) Close() error {
 	db.mu.Lock()
-	// No data
-	if db.active == nil && db.immutable == nil && len(db.sstables) == 0 {
+	if db.closed {
+		db.mu.Unlock()
 		return nil
 	}
+	db.closed = true
+	db.mu.Unlock()
 
-	// Capture references before marking as closed
+	// A flush can start compaction, so drain them in that order before closing
+	// any reader or WAL they may still use.
+	db.flushWg.Wait()
+	db.compactWg.Wait()
+
+	db.mu.Lock()
 	active := db.active
 	immutable := db.immutable
 	sstables := db.sstables
+	firstErr := db.backgroundErr
 
 	// Mark as closed
 	db.active = nil
@@ -515,10 +530,8 @@ func (db *DB) Close() error {
 	// close resource outside of lock
 	// avoid holding lock during I/O
 
-	var firstErr error
-
 	if active != nil {
-		if err := active.Close(); err != nil {
+		if err := active.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -535,36 +548,62 @@ func (db *DB) Close() error {
 		}
 	}
 
-	return nil
+	return firstErr
 }
 
-// Put writes a key-value pair into the DB.
-// Currently only writes to the active memtable (no flush/rotation yet).
+// Put writes a key-value pair to the WAL-backed active memtable and rotates it
+// when it reaches the configured size limit.
 func (db *DB) Put(key, value []byte) error {
-	db.mu.RLock()
-	mt := db.active
-	db.mu.RUnlock()
-
-	if mt == nil {
-		return ErrClosed
+	if value != nil && len(value) == 0 {
+		return ErrEmptyValue
 	}
+	for {
+		db.mu.RLock()
+		if db.closed {
+			db.mu.RUnlock()
+			return ErrClosed
+		}
+		if db.backgroundErr != nil {
+			err := db.backgroundErr
+			db.mu.RUnlock()
+			return err
+		}
+		mt := db.active
+		db.mu.RUnlock()
 
-	if err := mt.Put(key, value); err != nil {
-		return err
+		if mt == nil {
+			return ErrClosed
+		}
+
+		if err := mt.Put(key, value); err != nil {
+			if errors.Is(err, memtable.ErrFrozen) {
+				continue // rotation raced us; retry on the new active table
+			}
+			return err
+		}
+
+		if mt.IsFull() {
+			return db.rotateMemtable(mt)
+		}
+
+		return nil
 	}
-
-	if mt.IsFull() {
-		return db.rotateMemtable()
-	}
-
-	return nil
 }
 
 // rotateMemtable freezes the current active, moves it to immutable,
 // creates a new active, and starts a background flush.
-func (db *DB) rotateMemtable() error {
+func (db *DB) rotateMemtable(expected *memtable.Memtable) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	if db.closed {
+		return ErrClosed
+	}
+	if db.backgroundErr != nil {
+		return db.backgroundErr
+	}
+	if db.active != expected {
+		return nil
+	}
 
 	// Check if already rotating (immutable exists)
 	if db.immutable != nil {
@@ -573,24 +612,23 @@ func (db *DB) rotateMemtable() error {
 		return nil
 	}
 
-	// Freeze current active
-	db.active.Freeze()
-
-	// Save the old WAL path before moving to immutable
-	oldWalPath := db.active.WalPath()
-
-	// Move to immutable
-	db.immutable = db.active
-
-	// Create new active with new WAL
+	// Create the replacement first so a filesystem error cannot leave the
+	// current active memtable frozen with nowhere for writes to go.
 	newWalPath := filepath.Join(db.dataDir, fmt.Sprintf("active-%d.wal", time.Now().UnixNano()))
 	newActive, err := memtable.NewMemtable(newWalPath)
 	if err != nil {
-		// Rollback: unfreeze immutable and restore as active
-		// For simplicity, we'll just return error (in production, handle better)
 		return err
 	}
 
+	if err := db.active.Freeze(); err != nil {
+		_ = newActive.Close()
+		_ = os.Remove(newWalPath)
+		db.backgroundErr = fmt.Errorf("freeze WAL: %w", err)
+		return db.backgroundErr
+	}
+
+	oldWalPath := db.active.WalPath()
+	db.immutable = db.active
 	db.active = newActive
 
 	// Start background flush with the old WAL path (the one that should be deleted)
@@ -604,11 +642,13 @@ func (db *DB) rotateMemtable() error {
 // Lookup order: active memtable → immutable memtable → SSTables (newest first).
 func (db *DB) Get(key []byte) ([]byte, bool, error) {
 	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return nil, false, ErrClosed
+	}
 	active := db.active
 	immutable := db.immutable
-	sstables := make([]*sstable.Reader, len(db.sstables))
-	copy(sstables, db.sstables) // Copy slice to avoid holding lock
-	db.mu.RUnlock()
+	sstables := db.sstables
 
 	// 1. Check active memtable
 	if active != nil {
@@ -638,15 +678,15 @@ func (db *DB) Get(key []byte) ([]byte, bool, error) {
 	for _, reader := range sstables {
 		val, found, err := reader.Get(key)
 		if err != nil {
-			// Log error but continue to next SSTable
-			continue
+			return nil, false, err
 		}
 		if found {
-			// Reader.Get already returns a copy, so we can return directly
+			if val == nil {
+				return nil, false, nil
+			}
 			return val, true, nil
 		}
-		// If key > current key in SSTable, we can stop (keys are sorted)
-		// But our current Get is linear scan, so we check all SSTables
+		// SSTable time ranges overlap, so a miss must continue to older files.
 	}
 
 	return nil, false, nil

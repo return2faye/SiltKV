@@ -76,10 +76,10 @@ func TestDelete(t *testing.T) {
 		t.Fatalf("Failed to delete: %v", err)
 	}
 
-	// Verify it's gone
-	_, found = mt.Get([]byte("key1"))
-	if found {
-		t.Error("Key should not be found after delete")
+	// Internal lookups expose tombstones so the LSM read path can stop.
+	val, found = mt.Get([]byte("key1"))
+	if !found || val != nil {
+		t.Error("Get should return a found tombstone")
 	}
 }
 

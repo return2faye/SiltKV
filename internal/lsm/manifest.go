@@ -90,10 +90,18 @@ func appendToManifest(dataDir string, sstPath string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-
-	_, err = fmt.Fprintln(file, relPath)
-	return err
+	if _, err = fmt.Fprintln(file, relPath); err != nil {
+		file.Close()
+		return err
+	}
+	if err = file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err = file.Close(); err != nil {
+		return err
+	}
+	return syncDir(dataDir)
 }
 
 // rewriteManifest rewrites the entire manifest with current SSTable list.
@@ -112,8 +120,6 @@ func rewriteManifest(dataDir string, sstPaths []string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-
 	// Write all paths (as relative paths)
 	for _, sstPath := range sstPaths {
 		relPath, err := filepath.Rel(dataDir, sstPath)
@@ -137,5 +143,17 @@ func rewriteManifest(dataDir string, sstPaths []string) error {
 	}
 
 	// Atomic rename
-	return os.Rename(tmpPath, manifestPath)
+	if err := os.Rename(tmpPath, manifestPath); err != nil {
+		return err
+	}
+	return syncDir(dataDir)
+}
+
+func syncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }

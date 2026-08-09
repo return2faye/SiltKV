@@ -2,9 +2,9 @@ package memtable
 
 import (
 	"bytes"
+	"github.com/return2faye/SiltKV/internal/utils"
 	"math/rand"
 	"sync"
-	"github.com/return2faye/SiltKV/internal/utils"
 )
 
 // implementation of skiplist
@@ -114,16 +114,10 @@ func (sl *SkipList) Get(key []byte) ([]byte, bool) {
 
 	curr = curr.next[0]
 	if curr != nil && bytes.Equal(curr.key, key) {
-		if curr.value == nil {
-			return nil, false
-		}
-
 		return curr.value, true
 	}
 	return nil, false
 }
-
-
 
 /*
 Iterator

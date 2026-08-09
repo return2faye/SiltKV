@@ -1,3 +1,5 @@
+//go:build ignore
+
 package main
 
 import (
@@ -42,9 +44,9 @@ func main() {
 
 	// Write enough data to trigger flush
 	fmt.Println("\n2. Writing more data to trigger flush...")
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 1100; i++ {
 		key := fmt.Sprintf("key-%05d", i)
-		value := make([]byte, 5000) // 5KB per value
+		value := make([]byte, 4000)
 		for j := range value {
 			value[j] = byte(i + j)
 		}
@@ -98,8 +100,8 @@ func main() {
 		if !found {
 			log.Fatalf("Key %s not found after recovery!", keyStr)
 		}
-		if len(val) != 5000 {
-			log.Fatalf("Key %s: value length mismatch, expected 5000, got %d", keyStr, len(val))
+		if len(val) != 4000 {
+			log.Fatalf("Key %s: value length mismatch, expected 4000, got %d", keyStr, len(val))
 		}
 		verified++
 		fmt.Printf("  ✓ %s (length: %d)\n", keyStr, len(val))

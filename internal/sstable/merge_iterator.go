@@ -21,8 +21,7 @@ func NewMergeIterator(readers []*Reader) (*MergeIterator, error) {
 		if r != nil {
 			it := r.NewIterator()
 			if err := it.Next(); err != nil {
-				// Skip corrupted iterators
-				continue
+				return nil, err
 			}
 			if it.Valid() {
 				iterators = append(iterators, it)
@@ -108,7 +107,7 @@ func (mi *MergeIterator) advance() error {
 	// Advance all iterators with the same key
 	for _, it := range mi.current {
 		if err := it.Next(); err != nil {
-			// Iterator exhausted, will be skipped in next advance
+			return err
 		}
 	}
 

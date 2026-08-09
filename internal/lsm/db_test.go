@@ -2,14 +2,266 @@ package lsm
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/return2faye/SiltKV/internal/memtable"
+	"github.com/return2faye/SiltKV/internal/sstable"
 	"github.com/return2faye/SiltKV/internal/wal"
 )
+
+func writeSSTable(t *testing.T, path string, key, value []byte) {
+	t.Helper()
+	w, err := sstable.NewWriter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(key, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeleteMasksOlderSSTable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "old.sst")
+	writeSSTable(t, path, []byte("key"), []byte("old"))
+	if err := appendToManifest(dir, path); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(Options{DataDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Delete([]byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := db.Get([]byte("key")); err != nil || found {
+		t.Fatalf("deleted key: found=%v err=%v", found, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(Options{DataDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, found, err := db.Get([]byte("key")); err != nil || found {
+		t.Fatalf("deleted key after recovery: found=%v err=%v", found, err)
+	}
+}
+
+func TestCompactionPreservesNewestValueAfterReopen(t *testing.T) {
+	dir := t.TempDir()
+	for i := 1; i <= 5; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("table-%d.sst", i))
+		writeSSTable(t, path, []byte("key"), []byte(fmt.Sprintf("v%d", i)))
+		if err := appendToManifest(dir, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	db, err := Open(Options{DataDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.compactWg.Add(1)
+	db.compactSSTables()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(Options{DataDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	got, found, err := db.Get([]byte("key"))
+	if err != nil || !found || string(got) != "v5" {
+		t.Fatalf("Get after compaction/reopen = %q, found=%v err=%v", got, found, err)
+	}
+}
+
+func TestReadErrorDoesNotReturnStaleValue(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.sst")
+	newPath := filepath.Join(dir, "new.sst")
+	writeSSTable(t, oldPath, []byte("key"), []byte("old"))
+	writeSSTable(t, newPath, []byte("key"), []byte("new"))
+	if err := appendToManifest(dir, oldPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendToManifest(dir, newPath); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(Options{DataDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	f, err := os.OpenFile(newPath, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{0xff, 0xff, 0xff, 0xff}, 0); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if got, found, err := db.Get([]byte("key")); err == nil {
+		t.Fatalf("Get returned stale value %q (found=%v) instead of an error", got, found)
+	}
+}
+
+func TestRecoveryAfterProcessExit(t *testing.T) {
+	if os.Getenv("SILTKV_CRASH_HELPER") == "1" {
+		db, err := Open(Options{DataDir: os.Getenv("SILTKV_CRASH_DIR")})
+		if err != nil {
+			os.Exit(2)
+		}
+		if err := db.Put([]byte("key"), []byte("survives")); err != nil {
+			os.Exit(3)
+		}
+		os.Exit(0) // intentionally skip Close
+	}
+
+	dir := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRecoveryAfterProcessExit$")
+	cmd.Env = append(os.Environ(), "SILTKV_CRASH_HELPER=1", "SILTKV_CRASH_DIR="+dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("helper failed: %v: %s", err, out)
+	}
+	db, err := Open(Options{DataDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	got, found, err := db.Get([]byte("key"))
+	if err != nil || !found || string(got) != "survives" {
+		t.Fatalf("recovered value = %q, found=%v err=%v", got, found, err)
+	}
+}
+
+func TestConcurrentWritesAcrossRotation(t *testing.T) {
+	db, err := Open(Options{DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	value := make([]byte, 1024)
+	errCh := make(chan error, 8)
+	var wg sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < 700; i++ {
+				if err := db.Put([]byte(fmt.Sprintf("%d-%04d", worker, i)), value); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(worker)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestBackgroundFlushErrorSurfaces(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(Options{DataDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	walPath := filepath.Join(dir, "immutable.wal")
+	mt, err := memtable.NewMemtable(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mt.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := mt.Freeze(); err != nil {
+		t.Fatal(err)
+	}
+	db.mu.Lock()
+	db.immutable = mt
+	db.mu.Unlock()
+
+	db.flushWg.Add(1)
+	db.flushMemtable(mt, filepath.Join(dir, "missing", "immutable.wal"))
+	if _, err := os.Stat(walPath); err != nil {
+		t.Fatalf("recoverable WAL was removed: %v", err)
+	}
+	if got, found, err := db.Get([]byte("key")); err != nil || !found || string(got) != "value" {
+		t.Fatalf("Get after failed flush = %q, found=%v err=%v", got, found, err)
+	}
+	if err := db.Put([]byte("new"), []byte("value")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Put error = %v, want filesystem error", err)
+	}
+	if err := db.Close(); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Close error = %v, want filesystem error", err)
+	}
+}
+
+func TestBackgroundCompactionErrorSurfaces(t *testing.T) {
+	dir := t.TempDir()
+	paths := make([]string, 4)
+	for i := range paths {
+		key := []byte(fmt.Sprintf("k%d", i))
+		paths[i] = filepath.Join(dir, fmt.Sprintf("table-%d.sst", i))
+		writeSSTable(t, paths[i], key, []byte("value"))
+		if err := appendToManifest(dir, paths[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	db, err := Open(Options{DataDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(paths[0], os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{'X'}, int64(8+8+len("k0"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db.compactWg.Add(1)
+	db.compactSSTables()
+	if err := db.Put([]byte("new"), []byte("value")); !errors.Is(err, sstable.ErrCorruptSSTable) {
+		t.Fatalf("Put error = %v, want %v", err, sstable.ErrCorruptSSTable)
+	}
+	if got, err := loadManifest(dir); err != nil || len(got) != len(paths) {
+		t.Fatalf("manifest after failed compaction = %v, err=%v", got, err)
+	}
+	if outputs, err := filepath.Glob(filepath.Join(dir, "compact-*.sst")); err != nil || len(outputs) != 0 {
+		t.Fatalf("unpublished outputs = %v, err=%v", outputs, err)
+	}
+	if err := db.Close(); !errors.Is(err, sstable.ErrCorruptSSTable) {
+		t.Fatalf("Close error = %v, want %v", err, sstable.ErrCorruptSSTable)
+	}
+}
 
 // TestWALFileDeletionAfterFlush verifies that WAL files are deleted after successful flush
 func TestWALFileDeletionAfterFlush(t *testing.T) {
@@ -55,7 +307,7 @@ func TestWALFileDeletionAfterFlush(t *testing.T) {
 		if err := db.Put(key, value); err != nil {
 			t.Fatalf("Failed to put key %d: %v", i, err)
 		}
-		
+
 		// Check if flush was triggered by looking for new WAL files
 		// When flush happens, a new WAL file (active-*.wal) is created
 		if !flushTriggered {
@@ -74,7 +326,7 @@ func TestWALFileDeletionAfterFlush(t *testing.T) {
 	if !flushTriggered {
 		// Check WAL file size to see how much data was written
 		if stat, err := os.Stat(initialWalPath); err == nil {
-			t.Logf("WAL file size after writing %d keys: %d bytes (expected ~%d bytes)", 
+			t.Logf("WAL file size after writing %d keys: %d bytes (expected ~%d bytes)",
 				numKeys, stat.Size(), numKeys*(2+valueSize))
 		}
 		t.Fatalf("Flush was not triggered after writing %d keys. Memtable may not be full.", numKeys)

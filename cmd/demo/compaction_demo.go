@@ -1,3 +1,5 @@
+//go:build ignore
+
 package main
 
 import (
@@ -29,17 +31,17 @@ func main() {
 	// Write enough data to trigger multiple flushes and compaction
 	// Each flush creates ~4MB, so we need multiple flushes to trigger compaction
 	fmt.Println("2. Writing data to trigger multiple flushes and compaction...")
-	
+
 	keyCounter := 0
-	
+
 	// Write data in batches to trigger multiple flushes
 	for batch := 0; batch < 6; batch++ {
 		fmt.Printf("  Batch %d: Writing keys...\n", batch+1)
-		
-		// Write ~800 keys per batch (each ~5KB) = ~4MB per batch
-		for i := 0; i < 800; i++ {
+
+		// Write slightly more than 4 MiB per batch.
+		for i := 0; i < 1100; i++ {
 			key := fmt.Sprintf("key-%05d", keyCounter)
-			value := make([]byte, 5000) // 5KB per value
+			value := make([]byte, 4000)
 			for j := range value {
 				value[j] = byte(keyCounter + j)
 			}
@@ -52,7 +54,7 @@ func main() {
 			// Check if flush happened (by checking for new WAL files)
 			// This is a simple heuristic
 		}
-		
+
 		// Give some time for flush to complete
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -96,7 +98,7 @@ func main() {
 			continue
 		}
 		key := fmt.Sprintf("key-%05d", keyNum)
-		expectedValue := make([]byte, 5000)
+		expectedValue := make([]byte, 4000)
 		for j := range expectedValue {
 			expectedValue[j] = byte(keyNum + j)
 		}

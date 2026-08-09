@@ -1,3 +1,5 @@
+//go:build ignore
+
 package main
 
 import (
@@ -27,10 +29,10 @@ func main() {
 
 	// Write enough data to trigger flush
 	// Default memtable size is 4MB, so we need to write more than that
-	// Let's write 1000 keys with ~5KB each = ~5MB total
+	// Write slightly more than 4 MiB using supported 4 KiB values.
 	fmt.Println("2. Writing data to trigger flush...")
-	keyCount := 1000
-	valueSize := 5000 // 5KB per value
+	keyCount := 1100
+	valueSize := 4000
 
 	for i := 0; i < keyCount; i++ {
 		key := fmt.Sprintf("key-%05d", i)

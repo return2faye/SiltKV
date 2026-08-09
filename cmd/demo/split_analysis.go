@@ -1,3 +1,5 @@
+//go:build ignore
+
 package main
 
 import (
@@ -26,19 +28,19 @@ func main() {
 	defer db.Close()
 
 	maxSize := sstable.MaxSSTableFileSize()
-	
+
 	// Write data to create a scenario where we can test split
 	// We'll write enough to create multiple SSTables, then compact them
 	// The merged file should be large enough to trigger split
-	
+
 	fmt.Println("Writing data to trigger compaction...")
-	
+
 	// Write in batches to create multiple SSTables
 	keyCounter := 0
 	for batch := 0; batch < 8; batch++ {
-		for i := 0; i < 800; i++ {
+		for i := 0; i < 1100; i++ {
 			key := fmt.Sprintf("key-%08d", keyCounter)
-			value := make([]byte, 5000)
+			value := make([]byte, 4000)
 			for j := range value {
 				value[j] = byte(keyCounter + j)
 			}
@@ -55,14 +57,14 @@ func main() {
 
 	// Analyze files
 	sstFiles, _ := filepath.Glob(filepath.Join(tmpDir, "*.sst"))
-	
+
 	fmt.Printf("\nFound %d SSTable files:\n", len(sstFiles))
-	
+
 	compactFiles := []struct {
 		name string
 		size int64
 	}{}
-	
+
 	for _, f := range sstFiles {
 		info, err := os.Stat(f)
 		if err != nil {
@@ -70,14 +72,14 @@ func main() {
 		}
 		name := filepath.Base(f)
 		size := info.Size()
-		
+
 		if name[:7] == "compact" {
 			compactFiles = append(compactFiles, struct {
 				name string
 				size int64
 			}{name, size})
 		}
-		
+
 		fmt.Printf("  %s: %.2f MB\n", name, float64(size)/(1024*1024))
 	}
 
@@ -86,10 +88,10 @@ func main() {
 		fmt.Printf("  ✓ Split detected: %d compact files\n", len(compactFiles))
 		for _, cf := range compactFiles {
 			if cf.size > maxSize {
-				fmt.Printf("    ⚠ %s: %.2f MB (EXCEEDS %d MB limit!)\n", 
+				fmt.Printf("    ⚠ %s: %.2f MB (EXCEEDS %d MB limit!)\n",
 					cf.name, float64(cf.size)/(1024*1024), maxSize/(1<<20))
 			} else {
-				fmt.Printf("    ✓ %s: %.2f MB (within limit)\n", 
+				fmt.Printf("    ✓ %s: %.2f MB (within limit)\n",
 					cf.name, float64(cf.size)/(1024*1024))
 			}
 		}

@@ -1,92 +1,72 @@
 # SiltKV Benchmarks
 
-This directory contains benchmark tests for SiltKV to measure performance characteristics.
+这些 benchmark 测量当前完整 API，而不是只测内部数据结构：写入包含 WAL `write` syscall，但不包含逐条 `fsync`；`fsync` 默认每秒执行，并在 Freeze/Close 时强制执行。
 
-## Running Benchmarks
+## 负载口径
 
-### Run all benchmarks:
+| Benchmark | 测量内容 |
+|---|---|
+| `PutSmall` | 小 value、唯一 key 的 WAL + Memtable 写入 |
+| `WriteSteadyState1KiB` | 1 KiB value，运行足够久时覆盖 Flush/Compaction |
+| `GetMemtableHit` | active Memtable 命中 |
+| `GetSSTableHit` | 强制 Flush、Close、Reopen 后的 SSTable 命中 |
+| `GetSSTableMiss` | 真实 SSTable 非命中，覆盖 Bloom Filter 快速排除 |
+| `Mixed70Read30Write` | 固定 70% hit read / 30% unique write |
+| `ConcurrentWritesDistinctKeys` | 多 goroutine 写不同 key，避免覆盖造成虚高 |
+| `ConcurrentReads` | 多 goroutine Memtable hit |
+
+## 推荐命令
+
 ```bash
-go test -bench=. ./benchmark/...
+go test -run='^$' -bench=. -benchmem -benchtime=2s -count=3 ./benchmark
+go test -run='^$' -bench='Concurrent' -benchmem -benchtime=2s -cpu=1,4,8 ./benchmark
 ```
 
-### Run a specific benchmark:
+结果只应在相同机器、Go 版本、`-benchtime`、durability 语义与数据规模下比较。报告中至少给出 `ns/op`、`B/op`、`allocs/op`、CPU、Go 版本与命令；不要把一次最快值写成稳定 SLA。
+
+CPU / heap profiling：
+
 ```bash
-go test -bench=BenchmarkPut ./benchmark/...
+go test -run='^$' -bench=WriteSteadyState -benchtime=10s -cpuprofile=cpu.out -memprofile=mem.out ./benchmark
+go tool pprof cpu.out
 ```
 
-### Run with detailed output:
+## 最近验证
+
+环境：2026-08-09，Apple M4 Pro，macOS 26.5.1，Go 1.25.5，darwin/arm64。
+
+命令：
+
 ```bash
-go test -bench=. -benchmem ./benchmark/...
+go test -run='^$' -bench='<benchmark name or group>' -benchmem -benchtime=1s -count=3 ./benchmark
 ```
 
-### Run with CPU profiling:
-```bash
-go test -bench=. -cpuprofile=cpu.prof ./benchmark/...
-go tool pprof cpu.prof
+三次运行中位数：
+
+| Benchmark | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| PutSmall | 1,419 | 141 | 4 |
+| WriteSteadyState1KiB | 40,720（25.2 MB/s；31.2–46.1 μs） | 3,079 | 47 |
+| GetMemtableHit | 98.3 | 24 | 3 |
+| GetSSTableHit | 911.9 | 264 | 4 |
+| GetSSTableMiss | 78.0 | 16 | 1 |
+| Mixed70Read30Write | 1,038 | 76 | 3 |
+| ConcurrentWritesDistinctKeys | 2,194 | 161 | 5 |
+| ConcurrentReads | 170.7 | 24 | 3 |
+
+并发 CPU 矩阵（单次 1 秒）：
+
+| Benchmark | CPU=1 | CPU=4 | CPU=8 |
+|---|---:|---:|---:|
+| ConcurrentWritesDistinctKeys | 1,566 ns/op | 2,131 ns/op | 2,188 ns/op |
+| ConcurrentReads | 102.7 ns/op | 90.3 ns/op | 128.8 ns/op |
+
+结论：写路径受 WAL/Memtable 串行临界区限制，多核没有扩展；不能声称“并发写线性提升”。加入 Block CRC32 后，SSTable hit 通过复用读缓冲从 4,336 B/op 降至 264 B/op，同时中位延迟由 951.1 ns/op 降至 911.9 ns/op。持续写的 CRC/Flush 成本仍应通过长时间负载继续观察。
+
+当前仓库验证结果：
+
+```text
+go test ./...          PASS
+go test -race ./...    PASS
+go vet ./...           PASS
 ```
-
-### Run with memory profiling:
-```bash
-go test -bench=. -memprofile=mem.prof ./benchmark/...
-go tool pprof mem.prof
-```
-
-## Benchmark Descriptions
-
-- **BenchmarkPut**: Measures write performance (memtable only)
-- **BenchmarkGet**: Measures read performance from memtable
-- **BenchmarkGetFromSSTable**: Measures read performance after data is flushed to SSTable
-- **BenchmarkPutGet**: Measures mixed read-write performance
-- **BenchmarkSequentialWrite**: Measures sequential write performance
-- **BenchmarkRandomRead**: Measures random read performance
-- **BenchmarkDelete**: Measures delete performance
-- **BenchmarkWriteLargeValues**: Measures performance with large values (~4KB, web JSON payloads)
-- **BenchmarkWriteSmallValues**: Measures performance with small values
-- **BenchmarkConcurrentWrites**: Measures concurrent write performance
-- **BenchmarkConcurrentReads**: Measures concurrent read performance
-
-## Performance Results
-
-Current benchmark results (Apple M4 Pro, Go 1.x):
-
-| Benchmark | Performance | Memory | Allocations |
-|-----------|-------------|--------|-------------|
-| **BenchmarkPut** | 354.3 ns/op | 129 B/op | 4 allocs/op |
-| **BenchmarkGet** | 93.17 ns/op | 38 B/op | 3 allocs/op |
-| **BenchmarkGetFromSSTable** | 131.7 ns/op | 240 B/op | 3 allocs/op |
-| **BenchmarkPutGet** | 532.0 ns/op | 176 B/op | 7 allocs/op |
-| **BenchmarkSequentialWrite** | 420.0 ns/op | 179 B/op | 8 allocs/op |
-| **BenchmarkRandomRead** | 212.1 ns/op | 48 B/op | 3 allocs/op |
-| **BenchmarkDelete** | 347.7 ns/op | 88 B/op | 2 allocs/op |
-| **BenchmarkWriteLargeValues** (~4KB) | 4897 ns/op | 6496 B/op | 11 allocs/op |
-| **BenchmarkWriteSmallValues** | 437.8 ns/op | 160 B/op | 7 allocs/op |
-| **BenchmarkConcurrentWrites** | 598.8 ns/op | 72 B/op | 5 allocs/op |
-| **BenchmarkConcurrentReads** | 304.3 ns/op | 51 B/op | 4 allocs/op |
-
-### Performance Highlights
-
-- **Concurrent Write Performance**: ~6x improvement through fine-grained locking
-- **Single-threaded Write**: ~3x improvement with optimized lock granularity
-- **Read Performance**: Sub-200ns for memtable reads, ~130ns for SSTable reads
-- **Concurrent Operations**: Excellent scalability with minimal lock contention
-
-## Interpreting Results
-
-Benchmark results show:
-- **ns/op**: Nanoseconds per operation
-- **B/op**: Bytes allocated per operation
-- **allocs/op**: Number of allocations per operation
-
-Lower is better for all metrics.
-
-## Example Output
-
-```
-BenchmarkPut-8                   10000    123456 ns/op    1024 B/op    1 allocs/op
-BenchmarkGet-8                   50000     12345 ns/op     512 B/op    1 allocs/op
-```
-
-This means:
-- `BenchmarkPut` ran 10,000 iterations, averaging 123,456 nanoseconds per operation
-- Each operation allocated 1024 bytes and made 1 allocation
-- `-8` indicates it ran with 8 parallel goroutines (GOMAXPROCS)

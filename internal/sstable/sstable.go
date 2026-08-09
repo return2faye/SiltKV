@@ -4,18 +4,24 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"io"
+	"hash/crc32"
 	"os"
+	"sync"
 
 	"github.com/return2faye/SiltKV/internal/memtable"
 	"github.com/return2faye/SiltKV/internal/utils"
 )
 
 const (
-	maxSSTableKeySize   = 128        // 128B - maximum key size for SSTable
-	maxSSTableValueSize = 4 * 1024   // 4KB - maximum value size for SSTable
-	maxSSTableFileSize  = 64 << 20   // 64MB - maximum size for a single SSTable file
+	maxSSTableKeySize   = 128      // 128B - maximum key size for SSTable
+	maxSSTableValueSize = 4 * 1024 // 4KB - maximum value size for SSTable
+	maxSSTableFileSize  = 64 << 20 // 64MB - maximum size for a single SSTable file
+	maxBlockBufferSize  = 16 + maxSSTableKeySize + maxSSTableValueSize
 )
+
+var blockBufferPool = sync.Pool{New: func() any {
+	return make([]byte, maxBlockBufferSize)
+}}
 
 var (
 	// ErrCorruptSSTable is returned when an SSTable file has an invalid layout
@@ -41,10 +47,11 @@ type Writer struct {
 	fileSize        int64
 	blockIndex      *BlockIndex  // Block index for sparse indexing
 	bloomFilter     *BloomFilter // Bloom filter for fast key existence check
-	currentBlock    []byte       // Current block buffer being written
-	blockOffset     int64        // Starting offset of the current block
-	firstKeyInBlock []byte       // First key in the current block (for block start)
-	lastKeyInBlock  []byte       // Last key in the current block (for sparse index)
+	bloomHashes     []bloomHash
+	currentBlock    []byte // Current block buffer being written
+	blockOffset     int64  // Starting offset of the current block
+	firstKeyInBlock []byte // First key in the current block (for block start)
+	lastKeyInBlock  []byte // Last key in the current block (for sparse index)
 }
 
 func NewWriter(path string) (*Writer, error) {
@@ -73,7 +80,13 @@ func (w *Writer) flushCurrentBlock() error {
 	// Record the starting offset of the block
 	blockOffset := w.fileSize
 
-	// Write the block to the file
+	// Frame every block so readers can validate it before parsing records.
+	header := make([]byte, 8)
+	binary.LittleEndian.PutUint32(header[:4], uint32(len(w.currentBlock)))
+	binary.LittleEndian.PutUint32(header[4:], crc32.ChecksumIEEE(w.currentBlock))
+	if _, err := w.file.Write(header); err != nil {
+		return err
+	}
 	if _, err := w.file.Write(w.currentBlock); err != nil {
 		return err
 	}
@@ -84,7 +97,7 @@ func (w *Writer) flushCurrentBlock() error {
 	}
 
 	// Update file size
-	w.fileSize += int64(len(w.currentBlock))
+	w.fileSize += int64(len(header) + len(w.currentBlock))
 
 	// Reset current block (preserve capacity)
 	w.currentBlock = w.currentBlock[:0]
@@ -102,20 +115,19 @@ func (w *Writer) writeRecordToBlock(key, value []byte) (bool, error) {
 	vlen := uint32(len(value))
 	recordSize := 8 + len(key) + len(value)
 
-	if w.firstKeyInBlock == nil {
-		w.firstKeyInBlock = utils.CopyBytes(key)
-	}
-	// Always update last key in block (used for sparse index)
-	w.lastKeyInBlock = utils.CopyBytes(key)
-
 	// Check if the record can fit in the current block
+	flushed := false
 	if len(w.currentBlock)+recordSize > BlockSize && len(w.currentBlock) > 0 {
-		// Block is full, need to flush
 		if err := w.flushCurrentBlock(); err != nil {
 			return false, err
 		}
-		return true, nil
+		flushed = true
 	}
+
+	if w.firstKeyInBlock == nil {
+		w.firstKeyInBlock = utils.CopyBytes(key)
+	}
+	w.lastKeyInBlock = utils.CopyBytes(key)
 
 	// Write the record to the block buffer
 	header := make([]byte, 8)
@@ -126,13 +138,20 @@ func (w *Writer) writeRecordToBlock(key, value []byte) (bool, error) {
 	w.currentBlock = append(w.currentBlock, key...)
 	w.currentBlock = append(w.currentBlock, value...)
 
-	return false, nil
+	return flushed, nil
 }
 
-func (w *Writer) Close() error {
+func (w *Writer) Close() (retErr error) {
 	if w.file == nil {
 		return nil
 	}
+	defer func() {
+		closeErr := w.file.Close()
+		w.file = nil
+		if retErr == nil {
+			retErr = closeErr
+		}
+	}()
 
 	// 1. Flush remaining block
 	if err := w.flushCurrentBlock(); err != nil {
@@ -148,10 +167,12 @@ func (w *Writer) Close() error {
 	blockIndexSize := int64(len(blockIndexData))
 	w.fileSize += blockIndexSize
 
-	// 3. Write Bloom Filter
+	// 3. Build the Bloom Filter from the actual key count, then write it.
 	if w.bloomFilter == nil {
-		// If there's no data, create an empty Bloom Filter
-		w.bloomFilter = NewBloomFilter(1, 0.01)
+		w.bloomFilter = NewBloomFilter(uint32(len(w.bloomHashes)), 0.01)
+		for _, hash := range w.bloomHashes {
+			w.bloomFilter.addHash(hash)
+		}
 	}
 	bloomFilterData := w.bloomFilter.Bytes()
 	bloomFilterOffset := w.fileSize
@@ -173,9 +194,10 @@ func (w *Writer) Close() error {
 	}
 	w.fileSize += int64(len(footerData))
 
-	err := w.file.Close()
-	w.file = nil
-	return err
+	if err := w.file.Sync(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // WriteFromIterator writes all key-value pairs from the iterator to the SSTable
@@ -185,18 +207,13 @@ func (w *Writer) WriteFromIterator(it *memtable.SLIterator) error {
 		return os.ErrInvalid
 	}
 
-	// Initialize Bloom Filter (estimate capacity)
-	if w.bloomFilter == nil {
-		w.bloomFilter = NewBloomFilter(10000, 0.01)
-	}
-
 	// Iterate through the iterator and write data
 	for it.Valid() {
 		key := it.Key()
 		val := it.Value()
 
 		// Add to Bloom Filter
-		w.bloomFilter.Add(key)
+		w.bloomHashes = append(w.bloomHashes, hashBloomKey(key))
 
 		// Write to block
 		_, err := w.writeRecordToBlock(key, val)
@@ -217,13 +234,8 @@ func (w *Writer) Write(key, value []byte) (int64, error) {
 		return 0, os.ErrInvalid
 	}
 
-	// Initialize Bloom Filter (if not already initialized)
-	if w.bloomFilter == nil {
-		w.bloomFilter = NewBloomFilter(1000, 0.01)
-	}
-
 	// Add to Bloom Filter
-	w.bloomFilter.Add(key)
+	w.bloomHashes = append(w.bloomHashes, hashBloomKey(key))
 
 	// Write to block
 	_, err := w.writeRecordToBlock(key, value)
@@ -303,9 +315,11 @@ func (r *Reader) initialize() error {
 	r.footer = footer
 
 	// Validate footer offsets
+	footerOffset := r.fileSize - 32
 	if footer.BlockIndexOffset < 0 || footer.BlockIndexSize < 0 ||
-		footer.BloomFilterOffset < 0 || footer.BlockIndexOffset > r.fileSize ||
-		footer.BloomFilterOffset > r.fileSize {
+		footer.BloomFilterOffset < 0 ||
+		footer.BlockIndexOffset+footer.BlockIndexSize != footer.BloomFilterOffset ||
+		footer.BloomFilterOffset > footerOffset {
 		return ErrCorruptSSTable
 	}
 
@@ -324,9 +338,9 @@ func (r *Reader) initialize() error {
 	}
 
 	// Read bloom filter
-	if footer.BloomFilterOffset < footer.BlockIndexOffset {
-		bloomFilterSize := footer.BlockIndexOffset - footer.BloomFilterOffset
-		if bloomFilterSize > 0 && bloomFilterSize < 1024*1024 { // Sanity check: max 1MB
+	if footer.BloomFilterOffset < footerOffset {
+		bloomFilterSize := footerOffset - footer.BloomFilterOffset
+		if bloomFilterSize > 0 && bloomFilterSize < 16*1024*1024 {
 			bloomFilterData := make([]byte, bloomFilterSize)
 			if _, err := r.file.ReadAt(bloomFilterData, footer.BloomFilterOffset); err != nil {
 				return ErrCorruptSSTable
@@ -387,38 +401,53 @@ func (r *Reader) Get(key []byte) ([]byte, bool, error) {
 	return r.searchInBlock(key, blockOffset)
 }
 
-// searchInBlock searches for a key within the specified block
-func (r *Reader) searchInBlock(key []byte, blockOffset int64) ([]byte, bool, error) {
-	// Determine the end position of the block (start of next block or end of data section)
-	// Data section ends at the start of the Block Index (not the Bloom Filter).
-	// Layout: [data blocks][block index][bloom filter][footer]
+func (r *Reader) readBlock(blockOffset int64, buf []byte) ([]byte, error) {
 	blockEnd := r.footer.BlockIndexOffset
-	if len(r.blockIndex.Entries) > 0 {
-		// Find the offset of the next block
-		for _, entry := range r.blockIndex.Entries {
-			if entry.Offset > blockOffset {
-				blockEnd = entry.Offset
-				break
-			}
+	for _, entry := range r.blockIndex.Entries {
+		if entry.Offset > blockOffset {
+			blockEnd = entry.Offset
+			break
 		}
 	}
 
 	blockSize := blockEnd - blockOffset
-	if blockSize <= 0 {
-		return nil, false, nil
+	if blockSize <= 0 || blockSize > int64(len(buf)) {
+		return nil, ErrCorruptSSTable
 	}
 
-	// Read the entire block
-	blockData := make([]byte, blockSize)
+	blockData := buf[:int(blockSize)]
 	if _, err := r.file.ReadAt(blockData, blockOffset); err != nil {
+		return nil, ErrCorruptSSTable
+	}
+	if r.footer.MagicNumber == legacyMagicNumber {
+		return blockData, nil
+	}
+	if len(blockData) < 8 {
+		return nil, ErrCorruptSSTable
+	}
+	payload := blockData[8:]
+	if binary.LittleEndian.Uint32(blockData[:4]) != uint32(len(payload)) ||
+		binary.LittleEndian.Uint32(blockData[4:8]) != crc32.ChecksumIEEE(payload) {
+		return nil, ErrCorruptSSTable
+	}
+	return payload, nil
+}
+
+// searchInBlock searches for a key within the specified block
+func (r *Reader) searchInBlock(key []byte, blockOffset int64) ([]byte, bool, error) {
+	buf := blockBufferPool.Get().([]byte)
+	defer blockBufferPool.Put(buf)
+	blockData, err := r.readBlock(blockOffset, buf)
+	if err != nil {
 		return nil, false, err
 	}
+	blockSize := int64(len(blockData))
 
 	// Parse the block and search for the key
 	pos := int64(0)
 	for pos < blockSize {
 		if pos+8 > blockSize {
-			break
+			return nil, false, ErrCorruptSSTable
 		}
 
 		// Read header
@@ -426,19 +455,21 @@ func (r *Reader) searchInBlock(key []byte, blockOffset int64) ([]byte, bool, err
 		vlen := binary.LittleEndian.Uint32(blockData[pos+4 : pos+8])
 
 		if klen > maxSSTableKeySize || vlen > maxSSTableValueSize {
-			return nil, false, io.ErrUnexpectedEOF
+			return nil, false, ErrCorruptSSTable
 		}
 
 		totalLen := int64(klen) + int64(vlen)
 		if pos+8+totalLen > blockSize {
-			break
+			return nil, false, ErrCorruptSSTable
 		}
 
 		recordKey := blockData[pos+8 : pos+8+int64(klen)]
 		cmp := bytes.Compare(recordKey, key)
 
 		if cmp == 0 {
-			// Found it!
+			if vlen == 0 {
+				return nil, true, nil
+			}
 			recordValue := blockData[pos+8+int64(klen) : pos+8+totalLen]
 			return utils.CopyBytes(recordValue), true, nil
 		}
@@ -455,12 +486,14 @@ func (r *Reader) searchInBlock(key []byte, blockOffset int64) ([]byte, bool, err
 }
 
 type Iterator struct {
-	r       *Reader
-	pos     int64 // offset in file
-	dataEnd int64 // End position of data section (before Bloom Filter)
-	key     []byte
-	val     []byte
-	eof     bool
+	r          *Reader
+	blockIndex int
+	blockBuf   [maxBlockBufferSize]byte
+	blockData  []byte
+	pos        int
+	key        []byte
+	val        []byte
+	eof        bool
 }
 
 func (r *Reader) NewIterator() *Iterator {
@@ -469,23 +502,7 @@ func (r *Reader) NewIterator() *Iterator {
 		r.initialize()
 	}
 
-	// Determine the end position of the data section
-	dataEnd := r.fileSize
-	if r.footer != nil {
-		// New format: data ends before Block Index.
-		// Layout: [data blocks][block index][bloom filter][footer]
-		if r.footer.BlockIndexOffset >= 0 && r.footer.BlockIndexOffset <= r.fileSize-32 {
-			dataEnd = r.footer.BlockIndexOffset
-		} else if r.fileSize > 32 {
-			dataEnd = r.fileSize - 32
-		}
-	}
-
-	return &Iterator{
-		r:       r,
-		pos:     0,
-		dataEnd: dataEnd,
-	}
+	return &Iterator{r: r}
 }
 
 func (it *Iterator) Valid() bool {
@@ -508,85 +525,61 @@ func (it *Iterator) Next() error {
 		return os.ErrInvalid
 	}
 
-	// Check if we've reached the end of the data section
-	// Note: use >= instead of >, because pos is the next position to read
-	if it.pos >= it.dataEnd {
+	if it.pos >= len(it.blockData) {
+		if it.blockIndex >= len(it.r.blockIndex.Entries) {
+			it.eof = true
+			it.key, it.val = nil, nil
+			return nil
+		}
+		var err error
+		it.blockData, err = it.r.readBlock(it.r.blockIndex.Entries[it.blockIndex].Offset, it.blockBuf[:])
+		if err != nil {
+			it.eof = true
+			it.key, it.val = nil, nil
+			return err
+		}
+		it.blockIndex++
+		it.pos = 0
+	}
+
+	if it.pos+8 > len(it.blockData) {
 		it.eof = true
-		it.key, it.val = nil, nil
-		return nil
+		return ErrCorruptSSTable
 	}
-
-	// read header
-	header := make([]byte, 8)
-
-	// no header corruption
-	n, err := it.r.file.ReadAt(header, it.pos)
-	if err == io.EOF && n == 0 {
-		it.eof = true
-		it.key, it.val = nil, nil
-		return nil
-	}
-
-	// other problems
-	if err != nil && err != io.EOF {
-		return err
-	}
-
-	// header incomplete
-	if n < 8 {
-		it.eof = true
-		it.key, it.val = nil, nil
-		return nil
-	}
-
-	klen := binary.LittleEndian.Uint32(header[0:4])
-	vlen := binary.LittleEndian.Uint32(header[4:8])
+	klen := binary.LittleEndian.Uint32(it.blockData[it.pos : it.pos+4])
+	vlen := binary.LittleEndian.Uint32(it.blockData[it.pos+4 : it.pos+8])
 
 	// security check
 	if klen > maxSSTableKeySize {
 		it.eof = true
 		it.key, it.val = nil, nil
-		return nil
+		return ErrCorruptSSTable
 	}
 
 	if vlen > maxSSTableValueSize {
 		it.eof = true
 		it.key, it.val = nil, nil
-		return nil
+		return ErrCorruptSSTable
 	}
 
-	totalLen := int64(klen) + int64(vlen)
-	if totalLen < 0 {
-		it.eof = true
-		it.key, it.val = nil, nil
-		return nil
-	}
-
+	totalLen := int(klen) + int(vlen)
 	expectedEnd := it.pos + 8 + totalLen
-	if expectedEnd > it.dataEnd {
-		// Exceeded data section, reached end of file
+	if expectedEnd > len(it.blockData) {
 		it.eof = true
 		it.key, it.val = nil, nil
-		return nil
+		return ErrCorruptSSTable
 	}
 
-	buf := make([]byte, totalLen)
-	n, err = it.r.file.ReadAt(buf, it.pos+8)
-	if err != nil && err != io.EOF {
-		return err
+	record := it.blockData[it.pos+8 : expectedEnd]
+	it.key = record[:int(klen)]
+	if vlen == 0 {
+		it.val = nil
+	} else {
+		it.val = record[int(klen):]
 	}
-
-	if int64(n) < totalLen {
-		it.eof = true
-		it.key, it.val = nil, nil
-		return nil
-	}
-
-	it.key = buf[:klen]
-	it.val = buf[klen:]
 
 	// update position
-	it.pos += 8 + totalLen
+	it.pos = expectedEnd
 
 	return nil
 }

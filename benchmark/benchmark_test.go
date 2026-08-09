@@ -2,331 +2,191 @@ package benchmark
 
 import (
 	"fmt"
-	"math/rand"
 	"path/filepath"
+	"strconv"
+	"sync/atomic"
 	"testing"
 
 	"github.com/return2faye/SiltKV/pkg/kv"
 )
 
-// setupDB creates a temporary database for benchmarking
 func setupDB(b *testing.B) (*kv.DB, string) {
-	tmpDir := filepath.Join(b.TempDir(), "bench-db")
-	db, err := kv.Open(tmpDir)
+	b.Helper()
+	dir := filepath.Join(b.TempDir(), "bench-db")
+	db, err := kv.Open(dir)
 	if err != nil {
-		b.Fatalf("Failed to open DB: %v", err)
+		b.Fatal(err)
 	}
-	return db, tmpDir
+	return db, dir
 }
 
-// BenchmarkPut measures the performance of Put operations
-func BenchmarkPut(b *testing.B) {
+func setupSSTableDB(b *testing.B) (*kv.DB, []string) {
+	b.Helper()
+	db, dir := setupDB(b)
+	value := string(make([]byte, 100))
+	for i := 0; i < 50_000; i++ { // >4 MiB: guarantees at least one flush
+		if err := db.Put(fmt.Sprintf("key-%08d", i), value); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+	if files, _ := filepath.Glob(filepath.Join(dir, "*.sst")); len(files) == 0 {
+		b.Fatal("setup did not create an SSTable")
+	}
+	db, err := kv.Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	keys := make([]string, 1_000)
+	for i := range keys { // early keys are in the flushed SSTable
+		keys[i] = fmt.Sprintf("key-%08d", i)
+	}
+	return db, keys
+}
+
+func BenchmarkPutSmall(b *testing.B) {
 	db, _ := setupDB(b)
 	defer db.Close()
-
-	// Pre-generate keys and values to avoid allocation in benchmark
 	keys := make([]string, b.N)
-	values := make([]string, b.N)
-	for i := 0; i < b.N; i++ {
-		keys[i] = fmt.Sprintf("key-%d", i)
-		values[i] = fmt.Sprintf("value-%d", i)
+	for i := range keys {
+		keys[i] = strconv.Itoa(i)
 	}
-
-	b.ResetTimer()
 	b.ReportAllocs()
-
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := db.Put(keys[i], values[i]); err != nil {
-			b.Fatalf("Put failed: %v", err)
+		if err := db.Put(keys[i], "value"); err != nil {
+			b.Fatal(err)
 		}
 	}
 }
 
-// BenchmarkGet measures the performance of Get operations from memtable
-func BenchmarkGet(b *testing.B) {
+func BenchmarkWriteSteadyState1KiB(b *testing.B) {
 	db, _ := setupDB(b)
 	defer db.Close()
-
-	// Pre-populate with data
-	numKeys := 1000
-	for i := 0; i < numKeys; i++ {
-		key := fmt.Sprintf("key-%d", i)
-		value := fmt.Sprintf("value-%d", i)
-		if err := db.Put(key, value); err != nil {
-			b.Fatalf("Put failed: %v", err)
-		}
-	}
-
-	// Pre-generate keys to read
 	keys := make([]string, b.N)
-	for i := 0; i < b.N; i++ {
-		keys[i] = fmt.Sprintf("key-%d", i%numKeys)
+	for i := range keys {
+		keys[i] = strconv.Itoa(i)
 	}
-
-	b.ResetTimer()
+	value := string(make([]byte, 1024))
+	b.SetBytes(int64(len(value)))
 	b.ReportAllocs()
-
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Get(keys[i])
-		if err != nil && err != kv.ErrNotFound {
-			b.Fatalf("Get failed: %v", err)
+		if err := db.Put(keys[i], value); err != nil {
+			b.Fatal(err)
 		}
 	}
 }
 
-// BenchmarkGetFromSSTable measures Get performance after data is flushed to SSTable
-func BenchmarkGetFromSSTable(b *testing.B) {
+func BenchmarkGetMemtableHit(b *testing.B) {
 	db, _ := setupDB(b)
 	defer db.Close()
-
-	// Write enough data to trigger flush to SSTable
-	// Assuming memtable max size is around 1MB, write ~10MB to ensure flush
-	numKeys := 10000
-	valueSize := 100
-
-	for i := 0; i < numKeys; i++ {
-		key := fmt.Sprintf("key-%08d", i)
-		value := make([]byte, valueSize)
-		for j := range value {
-			value[j] = byte(i + j)
-		}
-		if err := db.Put(key, string(value)); err != nil {
-			b.Fatalf("Put failed: %v", err)
+	keys := make([]string, 1_000)
+	for i := range keys {
+		keys[i] = strconv.Itoa(i)
+		if err := db.Put(keys[i], "value"); err != nil {
+			b.Fatal(err)
 		}
 	}
-
-	// Wait a bit for flush to complete (in real scenario, you'd wait for flush)
-	// For benchmark, we'll just read from whatever is available
-
-	// Pre-generate keys to read
-	keys := make([]string, b.N)
-	for i := 0; i < b.N; i++ {
-		keys[i] = fmt.Sprintf("key-%08d", i%numKeys)
-	}
-
-	b.ResetTimer()
 	b.ReportAllocs()
-
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Get(keys[i])
-		if err != nil && err != kv.ErrNotFound {
-			b.Fatalf("Get failed: %v", err)
+		if _, err := db.Get(keys[i%len(keys)]); err != nil {
+			b.Fatal(err)
 		}
 	}
 }
 
-// BenchmarkMixedReadWrite measures mixed read/write with 30% writes and 70% reads.
-// Pre-populates data so reads hit existing keys; writes insert new keys.
-func BenchmarkMixedReadWrite(b *testing.B) {
+func BenchmarkGetSSTableHit(b *testing.B) {
+	db, keys := setupSSTableDB(b)
+	defer db.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := db.Get(keys[i%len(keys)]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkGetSSTableMiss(b *testing.B) {
+	db, _ := setupSSTableDB(b)
+	defer db.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := db.Get("missing-key"); err != kv.ErrNotFound {
+			b.Fatalf("Get miss error = %v", err)
+		}
+	}
+}
+
+func BenchmarkMixed70Read30Write(b *testing.B) {
 	db, _ := setupDB(b)
 	defer db.Close()
-
-	// Pre-populate so reads can hit existing keys
-	numPreload := 10000
-	for i := 0; i < numPreload; i++ {
-		key := fmt.Sprintf("key-%08d", i)
-		value := fmt.Sprintf("value-%08d", i)
-		if err := db.Put(key, value); err != nil {
-			b.Fatalf("Put failed: %v", err)
+	readKeys := make([]string, 1_000)
+	for i := range readKeys {
+		readKeys[i] = strconv.Itoa(i)
+		if err := db.Put(readKeys[i], "value"); err != nil {
+			b.Fatal(err)
 		}
 	}
-
-	// Pre-generate operation list: 30% write, 70% read
-	rng := rand.New(rand.NewSource(42))
-	type op struct {
-		isWrite bool
-		key     string
-		value   string
+	writeKeys := make([]string, b.N)
+	for i := range writeKeys {
+		writeKeys[i] = "new-" + strconv.Itoa(i)
 	}
-	ops := make([]op, b.N)
-	writeIdx := numPreload
-	for i := 0; i < b.N; i++ {
-		if rng.Intn(100) < 30 {
-			ops[i] = op{isWrite: true, key: fmt.Sprintf("key-%08d", writeIdx), value: fmt.Sprintf("value-%08d", writeIdx)}
-			writeIdx++
-		} else {
-			ops[i] = op{isWrite: false, key: fmt.Sprintf("key-%08d", rng.Intn(numPreload))}
-		}
-	}
-
-	b.ResetTimer()
 	b.ReportAllocs()
-
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if ops[i].isWrite {
-			if err := db.Put(ops[i].key, ops[i].value); err != nil {
-				b.Fatalf("Put failed: %v", err)
+		if i%10 < 3 {
+			if err := db.Put(writeKeys[i], "value"); err != nil {
+				b.Fatal(err)
 			}
-		} else {
-			_, err := db.Get(ops[i].key)
-			if err != nil && err != kv.ErrNotFound {
-				b.Fatalf("Get failed: %v", err)
-			}
+		} else if _, err := db.Get(readKeys[i%len(readKeys)]); err != nil {
+			b.Fatal(err)
 		}
 	}
 }
 
-// BenchmarkSequentialWrite measures sequential write performance
-func BenchmarkSequentialWrite(b *testing.B) {
+func BenchmarkConcurrentWritesDistinctKeys(b *testing.B) {
 	db, _ := setupDB(b)
 	defer db.Close()
-
-	b.ResetTimer()
+	var sequence atomic.Uint64
 	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		key := fmt.Sprintf("key-%010d", i)
-		value := fmt.Sprintf("value-%010d", i)
-		if err := db.Put(key, value); err != nil {
-			b.Fatalf("Put failed: %v", err)
-		}
-	}
-}
-
-// BenchmarkRandomRead measures random read performance
-func BenchmarkRandomRead(b *testing.B) {
-	db, _ := setupDB(b)
-	defer db.Close()
-
-	// Pre-populate with data
-	numKeys := 10000
-	for i := 0; i < numKeys; i++ {
-		key := fmt.Sprintf("key-%08d", i)
-		value := fmt.Sprintf("value-%08d", i)
-		if err := db.Put(key, value); err != nil {
-			b.Fatalf("Put failed: %v", err)
-		}
-	}
-
-	// Generate random keys
-	rng := rand.New(rand.NewSource(42))
-	keys := make([]string, b.N)
-	for i := 0; i < b.N; i++ {
-		keys[i] = fmt.Sprintf("key-%08d", rng.Intn(numKeys))
-	}
-
 	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		_, err := db.Get(keys[i])
-		if err != nil && err != kv.ErrNotFound {
-			b.Fatalf("Get failed: %v", err)
-		}
-	}
-}
-
-// BenchmarkDelete measures delete performance
-func BenchmarkDelete(b *testing.B) {
-	db, _ := setupDB(b)
-	defer db.Close()
-
-	// Pre-populate with data
-	keys := make([]string, b.N)
-	for i := 0; i < b.N; i++ {
-		keys[i] = fmt.Sprintf("key-%d", i)
-		if err := db.Put(keys[i], fmt.Sprintf("value-%d", i)); err != nil {
-			b.Fatalf("Put failed: %v", err)
-		}
-	}
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		if err := db.Delete(keys[i]); err != nil {
-			b.Fatalf("Delete failed: %v", err)
-		}
-	}
-}
-
-// BenchmarkWriteLargeValues measures performance with large values (web payloads)
-func BenchmarkWriteLargeValues(b *testing.B) {
-	db, _ := setupDB(b)
-	defer db.Close()
-
-	// Generate large value (~4KB compressed JSON)
-	largeValue := make([]byte, 4*1024)
-	for i := range largeValue {
-		largeValue[i] = byte(i % 256)
-	}
-	valueStr := string(largeValue)
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		key := fmt.Sprintf("key-%d", i)
-		if err := db.Put(key, valueStr); err != nil {
-			b.Fatalf("Put failed: %v", err)
-		}
-	}
-}
-
-// BenchmarkWriteSmallValues measures performance with small values
-func BenchmarkWriteSmallValues(b *testing.B) {
-	db, _ := setupDB(b)
-	defer db.Close()
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		key := fmt.Sprintf("key-%d", i)
-		value := fmt.Sprintf("v%d", i)
-		if err := db.Put(key, value); err != nil {
-			b.Fatalf("Put failed: %v", err)
-		}
-	}
-}
-
-// BenchmarkConcurrentWrites measures concurrent write performance
-func BenchmarkConcurrentWrites(b *testing.B) {
-	db, _ := setupDB(b)
-	defer db.Close()
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
 	b.RunParallel(func(pb *testing.PB) {
-		i := 0
 		for pb.Next() {
-			key := fmt.Sprintf("key-%d", i)
-			value := fmt.Sprintf("value-%d", i)
-			if err := db.Put(key, value); err != nil {
-				b.Fatalf("Put failed: %v", err)
+			key := strconv.FormatUint(sequence.Add(1), 10)
+			if err := db.Put(key, "value"); err != nil {
+				b.Error(err)
+				return
 			}
-			i++
 		}
 	})
 }
 
-// BenchmarkConcurrentReads measures concurrent read performance
 func BenchmarkConcurrentReads(b *testing.B) {
 	db, _ := setupDB(b)
 	defer db.Close()
-
-	// Pre-populate with data
-	numKeys := 1000
-	for i := 0; i < numKeys; i++ {
-		key := fmt.Sprintf("key-%d", i)
-		value := fmt.Sprintf("value-%d", i)
-		if err := db.Put(key, value); err != nil {
-			b.Fatalf("Put failed: %v", err)
+	keys := make([]string, 1_000)
+	for i := range keys {
+		keys[i] = strconv.Itoa(i)
+		if err := db.Put(keys[i], "value"); err != nil {
+			b.Fatal(err)
 		}
 	}
-
-	b.ResetTimer()
 	b.ReportAllocs()
-
+	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		rng := rand.New(rand.NewSource(42))
+		i := 0
 		for pb.Next() {
-			key := fmt.Sprintf("key-%d", rng.Intn(numKeys))
-			_, err := db.Get(key)
-			if err != nil && err != kv.ErrNotFound {
-				b.Fatalf("Get failed: %v", err)
+			if _, err := db.Get(keys[i%len(keys)]); err != nil {
+				b.Error(err)
+				return
 			}
+			i++
 		}
 	})
 }

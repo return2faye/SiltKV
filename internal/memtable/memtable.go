@@ -2,7 +2,6 @@ package memtable
 
 import (
 	"errors"
-	"log"
 	"sync"
 	"sync/atomic"
 
@@ -12,7 +11,7 @@ import (
 const (
 	// DefaultMaxSize is the default maximum size for memtable (4MB)
 	// When memtable reaches this size, it should be flushed to SSTable
-	DefaultMaxSize = 64 << 20
+	DefaultMaxSize = 4 << 20
 )
 
 var ErrFrozen = errors.New("memtable: frozen")
@@ -66,24 +65,21 @@ func (mt *Memtable) Put(key, value []byte) error {
 		return ErrFrozen
 	}
 
-	// Step 1: Write to WAL first (persistence) - must be sequential
-	// We only hold the lock for WAL write to minimize contention
+	// Keep WAL order and in-memory order identical so recovery cannot produce a
+	// different value after concurrent writes to the same key.
 	mt.mu.Lock()
+	defer mt.mu.Unlock()
 	// Double-check frozen after acquiring lock
 	if atomic.LoadInt32(&mt.frozen) == 1 {
-		mt.mu.Unlock()
 		return ErrFrozen
 	}
 	// If WAL write fails, we don't write to memory to maintain consistency
 	// Note: We don't Sync() here for performance. Sync happens when memtable is frozen (before flush).
 	if err := mt.wal.Write(key, value); err != nil {
-		mt.mu.Unlock()
 		return err
 	}
-	mt.mu.Unlock()
 
-	// Step 2: Write to SkipList (memory) - can happen concurrently after WAL write
-	// Get old size before update to calculate size change
+	// Apply to memory only after the WAL append succeeds.
 	oldValue, existed := mt.sl.Get(key)
 	mt.sl.Put(key, value)
 
@@ -146,7 +142,7 @@ func (mt *Memtable) IsFrozen() bool {
 // recoverFromWAL restores memtable from WAL file
 // This is called automatically during initialization
 func (mt *Memtable) recoverFromWAL() error {
-	result, err := mt.wal.Load(func(k, v []byte) {
+	_, err := mt.wal.Load(func(k, v []byte) {
 		// For each record in WAL, restore to SkipList
 		mt.sl.Put(k, v)
 
@@ -162,11 +158,6 @@ func (mt *Memtable) recoverFromWAL() error {
 	if err != nil {
 		return err
 	}
-
-	// Log recovery statistics
-	log.Printf("Memtable recovery: %d records recovered, %d skipped",
-		result.Recovered, result.Skipped)
-	_ = result // Recovery statistics available for logging if needed
 
 	return nil
 }

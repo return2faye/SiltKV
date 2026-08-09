@@ -41,6 +41,17 @@ func TestPutGet(t *testing.T) {
 	}
 }
 
+func TestPutRejectsEmptyValue(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "test-db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Put("key", ""); err != ErrInvalidValue {
+		t.Fatalf("Put empty value error = %v, want %v", err, ErrInvalidValue)
+	}
+}
+
 func TestGetNotFound(t *testing.T) {
 	tmpDir := filepath.Join(t.TempDir(), "test-db")
 	db, err := Open(tmpDir)
@@ -172,11 +183,9 @@ func TestClosedDB(t *testing.T) {
 		t.Errorf("Expected ErrClosed, got %v", err)
 	}
 
-	// Note: Get on closed DB might return ErrNotFound instead of ErrClosed
-	// because lsm.DB.Get returns (nil, false, nil) when active is nil
 	_, err = db.Get("key")
-	if err != ErrClosed && err != ErrNotFound {
-		t.Errorf("Expected ErrClosed or ErrNotFound, got %v", err)
+	if err != ErrClosed {
+		t.Errorf("Expected ErrClosed, got %v", err)
 	}
 
 	if err := db.Delete("key"); err != ErrClosed {

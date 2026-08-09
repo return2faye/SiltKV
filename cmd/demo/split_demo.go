@@ -1,3 +1,5 @@
+//go:build ignore
+
 package main
 
 import (
@@ -31,26 +33,25 @@ func main() {
 	// Write enough data to trigger compaction with large merged file
 	// We need to create multiple SSTables first, then compact them
 	// The merged file should exceed the limit and trigger split
-	
+
 	maxSize := sstable.MaxSSTableFileSize()
 	fmt.Printf("2. Writing data to create large merged file (target: > %d MB)...\n", maxSize/(1<<20))
-	
+
 	// Calculate how many keys we need
-	// Each key-value: key (10 bytes) + value (5000 bytes) + header (8 bytes) = ~5018 bytes
-	// To exceed maxSize, we need: maxSize / 5018 keys
-	keysNeeded := int((maxSize * 2) / 5018) // Write 2x the limit to ensure split
-	
+	// Each key-value is about 4 KiB including its header.
+	keysNeeded := int((maxSize * 2) / 4018) // Write 2x the limit to ensure split
+
 	fmt.Printf("   Need ~%d keys to create %d MB of data\n", keysNeeded, (maxSize*2)/(1<<20))
-	
+
 	keyCounter := 0
-	batchSize := 800 // ~4MB per batch to trigger flush
-	
+	batchSize := 1100 // slightly more than 4 MiB per batch
+
 	for batch := 0; keyCounter < keysNeeded; batch++ {
 		fmt.Printf("   Batch %d: Writing keys %d-%d...\n", batch+1, keyCounter, keyCounter+batchSize-1)
-		
+
 		for i := 0; i < batchSize && keyCounter < keysNeeded; i++ {
 			key := fmt.Sprintf("key-%08d", keyCounter)
-			value := make([]byte, 5000)
+			value := make([]byte, 4000)
 			for j := range value {
 				value[j] = byte(keyCounter + j)
 			}
@@ -60,7 +61,7 @@ func main() {
 			}
 			keyCounter++
 		}
-		
+
 		// Wait for flush
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -79,10 +80,10 @@ func main() {
 	}
 
 	fmt.Printf("  Found %d SSTable file(s):\n", len(sstFiles))
-	
+
 	compactFiles := make(map[string]int64) // filename -> size
 	activeFiles := make(map[string]int64)
-	
+
 	for _, f := range sstFiles {
 		info, err := os.Stat(f)
 		if err != nil {
@@ -90,13 +91,13 @@ func main() {
 		}
 		size := info.Size()
 		name := filepath.Base(f)
-		
+
 		if name[:7] == "compact" {
 			compactFiles[name] = size
 		} else {
 			activeFiles[name] = size
 		}
-		
+
 		fmt.Printf("    %s (%d bytes, %.2f MB)\n", name, size, float64(size)/(1024*1024))
 	}
 
@@ -106,10 +107,10 @@ func main() {
 		fmt.Printf("  ✓ File split detected! Found %d compact files\n", len(compactFiles))
 		for name, size := range compactFiles {
 			if size > maxSize {
-				fmt.Printf("    ⚠ %s is %.2f MB (exceeds %d MB limit!)\n", 
+				fmt.Printf("    ⚠ %s is %.2f MB (exceeds %d MB limit!)\n",
 					name, float64(size)/(1024*1024), maxSize/(1<<20))
 			} else {
-				fmt.Printf("    ✓ %s is %.2f MB (within limit)\n", 
+				fmt.Printf("    ✓ %s is %.2f MB (within limit)\n",
 					name, float64(size)/(1024*1024))
 			}
 		}
@@ -132,13 +133,13 @@ func main() {
 	fmt.Println("\n6. Verifying data integrity...")
 	testKeys := []int{0, 1000, 5000, 10000, 20000, 30000, keyCounter - 1}
 	verified := 0
-	
+
 	for _, keyNum := range testKeys {
 		if keyNum >= keyCounter {
 			continue
 		}
 		key := fmt.Sprintf("key-%08d", keyNum)
-		expectedValue := make([]byte, 5000)
+		expectedValue := make([]byte, 4000)
 		for j := range expectedValue {
 			expectedValue[j] = byte(keyNum + j)
 		}

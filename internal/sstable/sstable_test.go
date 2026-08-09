@@ -1,6 +1,9 @@
 package sstable
 
 import (
+	"encoding/binary"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -82,6 +85,134 @@ func TestFlushAndGet(t *testing.T) {
 	}
 	if found {
 		t.Error("Nonexistent key should not be found")
+	}
+}
+
+func TestRecordsAcrossBlocks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocks.sst")
+	w, err := NewWriter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := make([]byte, 200)
+	for i := 0; i < 100; i++ {
+		if _, err := w.Write([]byte(fmt.Sprintf("key-%03d", i)), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewReader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if r.bloomFilter == nil {
+		t.Fatal("bloom filter was not loaded")
+	}
+	for i := 0; i < 100; i++ {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		if _, found, err := r.Get(key); err != nil || !found {
+			t.Fatalf("Get(%q): found=%v err=%v", key, found, err)
+		}
+	}
+}
+
+func TestBlockChecksumDetectsCorruption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checksum.sst")
+	w, err := NewWriter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{'X'}, int64(8+8+len("key"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := NewReader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, _, err := r.Get([]byte("key")); !errors.Is(err, ErrCorruptSSTable) {
+		t.Fatalf("Get error = %v, want %v", err, ErrCorruptSSTable)
+	}
+	it := r.NewIterator()
+	if err := it.Next(); !errors.Is(err, ErrCorruptSSTable) {
+		t.Fatalf("iterator error = %v, want %v", err, ErrCorruptSSTable)
+	}
+}
+
+func TestTruncatedSSTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "truncated.sst")
+	w, err := NewWriter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, info.Size()-1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewReader(path); !errors.Is(err, ErrCorruptSSTable) {
+		t.Fatalf("NewReader error = %v, want %v", err, ErrCorruptSSTable)
+	}
+}
+
+func TestLegacySSTableReadable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.sst")
+	key, value := []byte("key"), []byte("value")
+	block := make([]byte, 8, 8+len(key)+len(value))
+	binary.LittleEndian.PutUint32(block[:4], uint32(len(key)))
+	binary.LittleEndian.PutUint32(block[4:], uint32(len(value)))
+	block = append(block, key...)
+	block = append(block, value...)
+	index := &BlockIndex{}
+	index.Add(key, 0)
+	indexData := index.Serialize()
+	bloom := NewBloomFilter(1, 0.01)
+	bloom.Add(key)
+	bloomData := bloom.Bytes()
+	footer := (&Footer{
+		BlockIndexOffset:  int64(len(block)),
+		BlockIndexSize:    int64(len(indexData)),
+		BloomFilterOffset: int64(len(block) + len(indexData)),
+		MagicNumber:       legacyMagicNumber,
+	}).Serialize()
+	data := append(append(append(block, indexData...), bloomData...), footer...)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewReader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	got, found, err := r.Get(key)
+	if err != nil || !found || string(got) != string(value) {
+		t.Fatalf("Get legacy = %q, found=%v err=%v", got, found, err)
 	}
 }
 

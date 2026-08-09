@@ -30,7 +30,7 @@ const (
 	maxValueSize = 4 * 1024
 	// maxRecordSize is the maximum allowed total record size (header + key + value)
 	maxRecordSize = headerSize + maxKeySize + maxValueSize
-	// maxWriteBufSize is the maximum buffer size before forcing a flush (64KB)
+	// maxWriteBufSize is the reusable append buffer capacity.
 	maxWriteBufSize = 64 << 10
 )
 
@@ -43,9 +43,7 @@ type WalWriter struct {
 	dataBuf   []byte // reusable buffer for Load data (grows as needed)
 
 	// Buffered writes for better throughput
-	writeBuf   []byte // buffer for batched writes
-	bufSize    int    // current buffer size
-	maxBufSize int    // maximum buffer size before flush
+	writeBuf []byte
 
 	closed   bool
 	asyncErr error // background fsync error (surfaced on Write/Sync)
@@ -60,13 +58,12 @@ func NewWalWriter(path string) (*WalWriter, error) {
 		return nil, err
 	}
 	w := &WalWriter{
-		file:       f,
-		buf:        make([]byte, 0, initialBufferSize),     // pre-allocate write buffer capacity
-		headerBuf:  make([]byte, headerSize),               // fixed-size header buffer
-		dataBuf:    make([]byte, 0, initialDataBufferSize), // pre-allocate data buffer capacity
-		writeBuf:   make([]byte, 0, maxWriteBufSize),       // pre-allocate write buffer
-		maxBufSize: maxWriteBufSize,
-		stopCh:     make(chan struct{}),
+		file:      f,
+		buf:       make([]byte, 0, initialBufferSize),     // pre-allocate write buffer capacity
+		headerBuf: make([]byte, headerSize),               // fixed-size header buffer
+		dataBuf:   make([]byte, 0, initialDataBufferSize), // pre-allocate data buffer capacity
+		writeBuf:  make([]byte, 0, maxWriteBufSize),       // pre-allocate write buffer
+		stopCh:    make(chan struct{}),
 	}
 
 	// Start background fsync loop (time-driven durability)
@@ -123,13 +120,11 @@ func (w *WalWriter) Write(key, value []byte) error {
 
 	// Append encoded record to write buffer
 	w.writeBuf = append(w.writeBuf, buf...)
-	w.bufSize += neededSize
 
-	// Flush to OS page cache if buffer is large enough
-	if w.bufSize >= w.maxBufSize {
-		if err := w.flushBufferLocked(); err != nil {
-			return err
-		}
+	// Make every acknowledged record visible to the OS. The periodic fsync
+	// below remains the power-loss durability boundary.
+	if err := w.flushBufferLocked(); err != nil {
+		return err
 	}
 
 	return nil
@@ -149,7 +144,6 @@ func (w *WalWriter) flushBufferLocked() error {
 
 	// Reset buffer
 	w.writeBuf = w.writeBuf[:0]
-	w.bufSize = 0
 	return nil
 }
 

@@ -12,6 +12,8 @@ var (
 	ErrNotFound = errors.New("kv: key not found")
 	// ErrClosed is returned when the DB is closed
 	ErrClosed = errors.New("kv: db is closed")
+	// ErrInvalidValue is returned because empty values are reserved for deletes.
+	ErrInvalidValue = errors.New("kv: value cannot be empty")
 )
 
 // DB represents a key-value database.
@@ -49,10 +51,12 @@ func (db *DB) Put(key, value string) error {
 	if db.db == nil {
 		return ErrClosed
 	}
+	if value == "" {
+		return ErrInvalidValue
+	}
 	err := db.db.Put([]byte(key), []byte(value))
 	if err != nil {
-		// Check if it's a closed error
-		if err.Error() == "lsm: db is closed" {
+		if errors.Is(err, lsm.ErrClosed) {
 			return ErrClosed
 		}
 		return fmt.Errorf("kv: put failed: %w", err)
@@ -69,19 +73,11 @@ func (db *DB) Get(key string) (string, error) {
 
 	val, found, err := db.db.Get([]byte(key))
 	if err != nil {
-		// Check if it's a closed error
-		if err.Error() == "lsm: db is closed" {
+		if errors.Is(err, lsm.ErrClosed) {
 			return "", ErrClosed
 		}
 		return "", fmt.Errorf("kv: get failed: %w", err)
 	}
-	
-	// If DB is closed, active will be nil and Get returns (nil, false, nil)
-	// We need to check if db.db is actually closed by trying to access it
-	// Actually, if db.db is closed, Get might return (nil, false, nil)
-	// So we can't distinguish between "not found" and "closed"
-	// For now, we'll trust that if db.db is not nil, it's not closed
-	
 	if !found {
 		return "", ErrNotFound
 	}
@@ -97,8 +93,7 @@ func (db *DB) Delete(key string) error {
 	}
 	err := db.db.Delete([]byte(key))
 	if err != nil {
-		// Check if it's a closed error
-		if err.Error() == "lsm: db is closed" {
+		if errors.Is(err, lsm.ErrClosed) {
 			return ErrClosed
 		}
 		return fmt.Errorf("kv: delete failed: %w", err)
